@@ -1,0 +1,6 @@
+{
+  "name": "Vault Manager",
+  "description": "Hệ thống quản lý mật khẩu an toàn với tính năng đồng bộ tự động từ trình duyệt và tra cứu qua Telegram Bot giả lập.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
