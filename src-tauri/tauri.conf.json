@@ -1,0 +1,39 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Vault Manager Wallet (Experimental)",
+  "version": "0.1.0",
+  "identifier": "com.eddyvn98.vaultmanager.wallet.experimental",
+  "build": {
+    "beforeDevCommand": "npm run dev:wallet",
+    "beforeBuildCommand": "npm run build:wallet",
+    "devUrl": "http://localhost:3000/wallet.html",
+    "frontendDist": "../dist-wallet"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [
+      {
+        "label": "main",
+        "title": "Vault Manager - Experimental Wallet",
+        "url": "wallet.html",
+        "width": 1040,
+        "height": 750,
+        "minWidth": 360,
+        "minHeight": 560
+      }
+    ],
+    "security": {
+      "capabilities": [
+        "wallet-window"
+      ],
+      "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost; object-src 'none'; base-uri 'none'; frame-src 'none'",
+      "devCsp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' ipc: http://ipc.localhost ws://localhost:3000 http://localhost:3000; object-src 'none'; base-uri 'none'; frame-src 'none'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "category": "Finance",
+    "icon": []
+  }
+}
