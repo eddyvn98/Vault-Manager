@@ -6,10 +6,12 @@ pub fn run() {
         .manage(wallet::WalletSession::default())
         .invoke_handler(tauri::generate_handler![
             wallet::wallet_status,
-            wallet::create_wallet,
+            wallet::start_wallet_creation,
+            wallet::finalize_wallet_creation,
             wallet::restore_wallet,
             wallet::unlock_wallet,
             wallet::lock_wallet,
+            wallet::touch_session,
             wallet::reset_wallet
         ])
         .run(tauri::generate_context!())

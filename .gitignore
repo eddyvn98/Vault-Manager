@@ -11,6 +11,10 @@ coverage/
 # Native build artifacts and locally generated mobile projects
 src-tauri/target/
 src-tauri/gen/
+!src-tauri/gen/android/app/src/main/AndroidManifest.xml
+!src-tauri/gen/android/app/src/main/java/**/MainActivity.kt
+!src-tauri/gen/android/app/src/main/res/xml/
+!src-tauri/gen/android/app/src/main/res/xml/*.xml
 src-tauri/.cargo/
 src-tauri/.tauri/
 *.keystore
