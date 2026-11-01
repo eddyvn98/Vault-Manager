@@ -180,6 +180,27 @@ pub fn parse_json_rpc_result(body: &str, expected_id: u32) -> Result<String, Str
         .ok_or_else(|| "JSON-RPC response missing both result and error".to_string())
 }
 
+pub fn verify_chain_id(
+    chain_id_hex: &str,
+    expected_chain_id: u64,
+    network_name: &str,
+) -> Result<u64, String> {
+    let clean = chain_id_hex.trim().trim_start_matches("0x").trim_start_matches("0X");
+    if clean.is_empty() {
+        return Err("Empty chainId response from RPC".into());
+    }
+    let actual_chain_id = u64::from_str_radix(clean, 16)
+        .map_err(|e| format!("Invalid chainId returned by RPC ({}): {}", chain_id_hex, e))?;
+
+    if actual_chain_id != expected_chain_id {
+        return Err(format!(
+            "Chain ID mismatch: Node returned {} (0x{:x}), but expected {} for {}",
+            actual_chain_id, actual_chain_id, expected_chain_id, network_name
+        ));
+    }
+    Ok(actual_chain_id)
+}
+
 pub async fn call_json_rpc(
     client: &Client,
     rpc_url: &str,
@@ -281,16 +302,7 @@ pub async fn fetch_bsc_balance(address: &str, testnet: bool) -> Result<BscBalanc
 
     // 1. Verify eth_chainId to guarantee we are talking to the expected blockchain network
     let chain_id_hex = call_json_rpc(&client, rpc_url, "eth_chainId", serde_json::json!([]), 1).await?;
-    let clean_chain_id = chain_id_hex.trim().trim_start_matches("0x");
-    let actual_chain_id = u64::from_str_radix(clean_chain_id, 16)
-        .map_err(|e| format!("Invalid chainId returned by RPC ({}): {}", chain_id_hex, e))?;
-
-    if actual_chain_id != expected_chain_id {
-        return Err(format!(
-            "Chain ID mismatch: Node returned {} (0x{:x}), but expected {} for {}",
-            actual_chain_id, actual_chain_id, expected_chain_id, network_name
-        ));
-    }
+    let actual_chain_id = verify_chain_id(&chain_id_hex, expected_chain_id, &network_name)?;
 
     // 2. Fetch native BNB balance (eth_getBalance)
     let raw_bnb_hex = call_json_rpc(
@@ -446,5 +458,26 @@ mod tests {
 
         // 5. Malformed JSON
         assert!(parse_json_rpc_result("not json", 1).is_err());
+    }
+
+    #[test]
+    fn verify_chain_id_tests() {
+        // BSC Mainnet (56 / 0x38)
+        assert_eq!(verify_chain_id("0x38", 56, "BSC Mainnet").unwrap(), 56);
+        assert_eq!(verify_chain_id("0x38", 56, "BSC Mainnet").unwrap(), 56);
+
+        // BSC Testnet (97 / 0x61)
+        assert_eq!(verify_chain_id("0x61", 97, "BSC Testnet").unwrap(), 97);
+
+        // Mismatched chain IDs must be rejected
+        // Ethereum Mainnet (0x1 = 1) connected to BSC expected endpoint
+        assert!(verify_chain_id("0x1", 56, "BSC Mainnet").is_err());
+        // Polygon (0x89 = 137) connected to BSC Testnet expected endpoint
+        assert!(verify_chain_id("0x89", 97, "BSC Testnet").is_err());
+
+        // Empty or invalid hex must be rejected
+        assert!(verify_chain_id("", 56, "BSC Mainnet").is_err());
+        assert!(verify_chain_id("0x", 56, "BSC Mainnet").is_err());
+        assert!(verify_chain_id("invalid", 56, "BSC Mainnet").is_err());
     }
 }
