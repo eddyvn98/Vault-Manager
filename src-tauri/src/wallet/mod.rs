@@ -282,20 +282,32 @@ pub async fn query_btc_balance(
     address: String,
     signet: bool,
 ) -> Result<blockchain::BtcBalance, String> {
-    // Check auto-lock and unlock status, then drop session Mutex immediately before async network fetch.
-    {
+    // 1. Verify session and cryptographically authenticate that the address belongs to this wallet
+    let (target_address, network) = {
         let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
         if !check_and_apply_auto_lock(&mut session) {
             return Err("Wallet is locked".into());
         }
-    }
+        let mnemonic = session
+            .mnemonic
+            .as_ref()
+            .ok_or_else(|| "Wallet is locked".to_string())?;
 
-    let network = if signet {
-        bitcoin::Network::Signet
-    } else {
-        bitcoin::Network::Bitcoin
+        let network = if signet {
+            bitcoin::Network::Signet
+        } else {
+            bitcoin::Network::Bitcoin
+        };
+        let derived_addr = bip::derive_btc_address(mnemonic, network)?;
+
+        if !address.trim().is_empty() && address.trim() != derived_addr {
+            return Err("Address mismatch: requested address does not belong to the unlocked wallet".into());
+        }
+        (derived_addr, network)
     };
-    blockchain::fetch_btc_balance(&address, network).await
+
+    // 2. Perform async network request without holding any Mutex
+    blockchain::fetch_btc_balance(&target_address, network).await
 }
 
 #[tauri::command]
@@ -304,15 +316,27 @@ pub async fn query_bsc_balance(
     address: String,
     testnet: bool,
 ) -> Result<blockchain::BscBalance, String> {
-    // Check auto-lock and unlock status, then drop session Mutex immediately before async network fetch.
-    {
+    // 1. Verify session and cryptographically authenticate that the address belongs to this wallet
+    let target_address = {
         let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
         if !check_and_apply_auto_lock(&mut session) {
             return Err("Wallet is locked".into());
         }
-    }
+        let mnemonic = session
+            .mnemonic
+            .as_ref()
+            .ok_or_else(|| "Wallet is locked".to_string())?;
 
-    blockchain::fetch_bsc_balance(&address, testnet).await
+        let derived_addr = bip::derive_bsc_address(mnemonic)?;
+
+        if !address.trim().is_empty() && address.trim().to_lowercase() != derived_addr.to_lowercase() {
+            return Err("Address mismatch: requested address does not belong to the unlocked wallet".into());
+        }
+        derived_addr
+    };
+
+    // 2. Perform async network request without holding any Mutex
+    blockchain::fetch_bsc_balance(&target_address, testnet).await
 }
 
 /// Secure reset: Requires valid password verification to authenticate the owner before deleting.

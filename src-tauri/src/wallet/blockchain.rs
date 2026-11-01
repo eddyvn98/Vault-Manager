@@ -85,11 +85,21 @@ pub fn format_satoshis(satoshis: u64) -> String {
 }
 
 pub fn format_wei_18(raw_hex_or_dec: &str) -> Result<String, String> {
-    let clean = raw_hex_or_dec.trim().trim_start_matches("0x");
-    let clean = if clean.is_empty() { "0" } else { clean };
+    let trimmed = raw_hex_or_dec.trim();
+    if trimmed.is_empty() || trimmed == "0x" || trimmed == "0X" {
+        return Err("Empty or missing hex value for wei".into());
+    }
+    let clean = trimmed.trim_start_matches("0x").trim_start_matches("0X");
+    if clean.is_empty() {
+        return Err("Empty hex payload after 0x prefix".into());
+    }
 
     let value = BigUint::from_str_radix(clean, 16)
         .map_err(|e| format!("Invalid hex value for uint256 wei: {}", e))?;
+
+    if value.bits() > 256 {
+        return Err("Value exceeds uint256 maximum limit (256 bits)".into());
+    }
 
     let divisor = BigUint::from(10u64).pow(18);
     let int_part = &value / &divisor;
@@ -97,13 +107,13 @@ pub fn format_wei_18(raw_hex_or_dec: &str) -> Result<String, String> {
 
     let rem_str = format!("{:0>18}", rem_part.to_str_radix(10));
     let dec6 = &rem_str[..6];
-    let trimmed = dec6.trim_end_matches('0');
-    let final_decimals = if trimmed.is_empty() {
+    let trimmed_dec = dec6.trim_end_matches('0');
+    let final_decimals = if trimmed_dec.is_empty() {
         "0000".to_string()
-    } else if trimmed.len() < 4 {
-        format!("{:0<4}", trimmed)
+    } else if trimmed_dec.len() < 4 {
+        format!("{:0<4}", trimmed_dec)
     } else {
-        trimmed.to_string()
+        trimmed_dec.to_string()
     };
 
     Ok(format!("{}.{}", int_part.to_str_radix(10), final_decimals))
@@ -121,16 +131,86 @@ pub fn calculate_esplora_balances(
             spent, funded
         ));
     }
-    let confirmed = (funded - spent) as u64;
+    let confirmed_i128 = funded - spent;
+    if confirmed_i128 > (u64::MAX as i128) {
+        return Err("Confirmed balance exceeds u64 limit".into());
+    }
+    let confirmed = confirmed_i128 as u64;
 
     let mempool_funded = mempool.funded_txo_sum as i128;
     let mempool_spent = mempool.spent_txo_sum as i128;
-    let unconfirmed = (mempool_funded - mempool_spent) as i64;
+    let unconfirmed_i128 = mempool_funded - mempool_spent;
 
-    let total_i128 = (confirmed as i128) + (unconfirmed as i128);
-    let total = if total_i128 < 0 { 0 } else { total_i128 as u64 };
+    if unconfirmed_i128 < (i64::MIN as i128) || unconfirmed_i128 > (i64::MAX as i128) {
+        return Err("Unconfirmed balance exceeds i64 bounds".into());
+    }
+    let unconfirmed = unconfirmed_i128 as i64;
 
-    Ok((confirmed, unconfirmed, total))
+    let total_i128 = confirmed_i128 + unconfirmed_i128;
+    if total_i128 < 0 {
+        return Err(format!(
+            "Inconsistent mempool data: unconfirmed spend ({} sats) exceeds confirmed balance ({} sats)",
+            -unconfirmed, confirmed
+        ));
+    }
+    if total_i128 > (u64::MAX as i128) {
+        return Err("Total balance exceeds u64 limit".into());
+    }
+
+    Ok((confirmed, unconfirmed, total_i128 as u64))
+}
+
+pub fn parse_json_rpc_result(body: &str, expected_id: u32) -> Result<String, String> {
+    let rpc_data: JsonRpcResponse = serde_json::from_str(body)
+        .map_err(|e| format!("Invalid JSON-RPC format: {}", e))?;
+
+    if let Some(err) = rpc_data.error {
+        return Err(format!("JSON-RPC error {}: {}", err.code, err.message));
+    }
+
+    if rpc_data.id != expected_id {
+        return Err(format!(
+            "JSON-RPC ID mismatch: expected {}, got {}",
+            expected_id, rpc_data.id
+        ));
+    }
+
+    rpc_data
+        .result
+        .ok_or_else(|| "JSON-RPC response missing both result and error".to_string())
+}
+
+pub async fn call_json_rpc(
+    client: &Client,
+    rpc_url: &str,
+    method: &str,
+    params: serde_json::Value,
+    req_id: u32,
+) -> Result<String, String> {
+    let req = JsonRpcRequest {
+        jsonrpc: "2.0",
+        method,
+        params,
+        id: req_id,
+    };
+
+    let resp = client
+        .post(rpc_url)
+        .json(&req)
+        .send()
+        .await
+        .map_err(|e| format!("RPC request failed: {}", e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("RPC HTTP status error: {}", resp.status()));
+    }
+
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("Failed to read RPC response body: {}", e))?;
+
+    parse_json_rpc_result(&text, req_id)
 }
 
 pub async fn fetch_btc_balance(address: &str, network: Network) -> Result<BtcBalance, String> {
@@ -177,52 +257,6 @@ pub async fn fetch_btc_balance(address: &str, network: Network) -> Result<BtcBal
         total_satoshis: total,
         formatted_btc: format_satoshis(total),
     })
-}
-
-pub async fn call_json_rpc(
-    client: &Client,
-    rpc_url: &str,
-    method: &str,
-    params: serde_json::Value,
-    req_id: u32,
-) -> Result<String, String> {
-    let req = JsonRpcRequest {
-        jsonrpc: "2.0",
-        method,
-        params,
-        id: req_id,
-    };
-
-    let resp = client
-        .post(rpc_url)
-        .json(&req)
-        .send()
-        .await
-        .map_err(|e| format!("RPC request failed: {}", e))?;
-
-    if !resp.status().is_success() {
-        return Err(format!("RPC HTTP status error: {}", resp.status()));
-    }
-
-    let rpc_data: JsonRpcResponse = resp
-        .json()
-        .await
-        .map_err(|e| format!("Invalid JSON-RPC format: {}", e))?;
-
-    if let Some(err) = rpc_data.error {
-        return Err(format!("JSON-RPC error {}: {}", err.code, err.message));
-    }
-
-    if rpc_data.id != req_id {
-        return Err(format!(
-            "JSON-RPC ID mismatch: expected {}, got {}",
-            req_id, rpc_data.id
-        ));
-    }
-
-    rpc_data
-        .result
-        .ok_or_else(|| "JSON-RPC response missing both result and error".to_string())
 }
 
 pub async fn fetch_bsc_balance(address: &str, testnet: bool) -> Result<BscBalance, String> {
@@ -347,18 +381,22 @@ mod tests {
         assert_eq!(format_wei_18("0x0").unwrap(), "0.0000");
 
         // Small balance: 0.000123 BNB
-        // 0.000123 * 10^18 = 123000000000000 = 0x6fe25b018c00
         assert_eq!(format_wei_18("0x6fe25b018c00").unwrap(), "0.000123");
 
-        // Massive Uint256 > u128::MAX (e.g. 2^130 wei)
-        // 2^130 in hex = 0x400000000000000000000000000000000
-        let massive_hex = "0x400000000000000000000000000000000";
-        let formatted = format_wei_18(massive_hex).unwrap();
-        assert!(formatted.starts_with("1361129467683753853853"), "Uint256 > u128::MAX parsed accurately");
+        // 256-bit boundary tests
+        // 2^130 in hex = 0x400000000000000000000000000000000 (fits in uint256)
+        let fits_u256_hex = "0x400000000000000000000000000000000";
+        assert!(format_wei_18(fits_u256_hex).is_ok());
 
-        // Invalid hex MUST return Err, NEVER silence to 0!
+        // Value > 256 bits MUST error
+        let exceeds_256_bits = "0x10000000000000000000000000000000000000000000000000000000000000000";
+        assert!(format_wei_18(exceeds_256_bits).is_err());
+
+        // Empty hex or bare prefix MUST error
+        assert!(format_wei_18("").is_err());
+        assert!(format_wei_18("0x").is_err());
+        assert!(format_wei_18("0X").is_err());
         assert!(format_wei_18("not_a_hex").is_err());
-        assert!(format_wei_18("0xGG").is_err());
     }
 
     #[test]
@@ -371,7 +409,7 @@ mod tests {
         assert_eq!(unconfirmed, 50_000);
         assert_eq!(total, 650_000);
 
-        // Mempool negative pending (unconfirmed spend)
+        // Mempool negative pending (unconfirmed spend less than confirmed)
         let mempool_spend = EsploraStats { funded_txo_sum: 0, spent_txo_sum: 100_000 };
         let (conf2, unconf2, total2) = calculate_esplora_balances(&chain, &mempool_spend).unwrap();
         assert_eq!(conf2, 600_000);
@@ -381,22 +419,32 @@ mod tests {
         // Inconsistent chain stats (spent > funded) MUST error
         let bad_chain = EsploraStats { funded_txo_sum: 100, spent_txo_sum: 500 };
         assert!(calculate_esplora_balances(&bad_chain, &mempool).is_err());
+
+        // Inconsistent mempool spend (unconfirmed spend > confirmed balance) MUST error
+        let huge_spend = EsploraStats { funded_txo_sum: 0, spent_txo_sum: 800_000 };
+        assert!(calculate_esplora_balances(&chain, &huge_spend).is_err());
     }
 
     #[test]
-    fn json_rpc_error_handling_simulation() {
-        let error_json = r#"{
-            "jsonrpc": "2.0",
-            "id": 1,
-            "error": {
-                "code": -32000,
-                "message": "Node unavailable"
-            }
-        }"#;
+    fn parse_json_rpc_result_tests() {
+        // 1. Success case
+        let ok_json = r#"{"jsonrpc":"2.0","id":1,"result":"0x38"}"#;
+        assert_eq!(parse_json_rpc_result(ok_json, 1).unwrap(), "0x38");
 
-        let parsed: JsonRpcResponse = serde_json::from_str(error_json).unwrap();
-        assert!(parsed.error.is_some());
-        assert_eq!(parsed.error.as_ref().unwrap().code, -32000);
-        assert!(parsed.result.is_none());
+        // 2. RPC Error case
+        let err_json = r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"Node unavailable"}}"#;
+        let err = parse_json_rpc_result(err_json, 1).unwrap_err();
+        assert!(err.contains("-32000"));
+        assert!(err.contains("Node unavailable"));
+
+        // 3. ID Mismatch case
+        assert!(parse_json_rpc_result(ok_json, 2).is_err());
+
+        // 4. Missing result and error
+        let empty_json = r#"{"jsonrpc":"2.0","id":1}"#;
+        assert!(parse_json_rpc_result(empty_json, 1).is_err());
+
+        // 5. Malformed JSON
+        assert!(parse_json_rpc_result("not json", 1).is_err());
     }
 }
