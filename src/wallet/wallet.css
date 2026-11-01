@@ -437,3 +437,127 @@ button:disabled {
   justify-content: flex-end;
   margin-top: 10px;
 }
+
+/* Dashboard Address & Network styles */
+.asset-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.btc-badge {
+  background: #f59e0b !important;
+}
+
+.bsc-badge {
+  background: #eab308 !important;
+  color: #0f172a !important;
+}
+
+.tag-chip {
+  font-size: 11px;
+  font-weight: 700;
+  background: #1e293b;
+  color: #94a3b8;
+  padding: 3px 8px;
+  border-radius: 6px;
+  border: 1px solid #334155;
+}
+
+.network-toggle {
+  display: flex;
+  background: #090e1a;
+  border-radius: 8px;
+  padding: 2px;
+  border: 1px solid #1e293b;
+}
+
+.toggle-btn {
+  padding: 4px 10px !important;
+  font-size: 11.5px !important;
+  font-weight: 600 !important;
+  background: transparent !important;
+  color: #64748b !important;
+  border-radius: 6px !important;
+}
+
+.toggle-btn.active {
+  background: #0284c7 !important;
+  color: #ffffff !important;
+}
+
+.address-box {
+  background: #090e1a;
+  padding: 10px 14px;
+  border-radius: 8px;
+  border: 1px solid #1e293b;
+  margin-top: 6px;
+  display: grid;
+  gap: 4px;
+}
+
+.address-label {
+  font-size: 11px;
+  color: #64748b;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  font-weight: 700;
+}
+
+.address-display {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.address-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 13px;
+  color: #38bdf8;
+  word-break: break-all;
+}
+
+.icon-copy-btn {
+  background: #1e293b !important;
+  color: #cbd5e1 !important;
+  border: 1px solid #334155 !important;
+  padding: 6px !important;
+  border-radius: 6px !important;
+  flex-shrink: 0;
+}
+
+.icon-copy-btn:hover {
+  background: #334155 !important;
+}
+
+.contract-box {
+  background: rgba(15, 23, 42, 0.6);
+  padding: 8px 12px;
+  border-radius: 8px;
+  border: 1px solid #1e293b;
+  font-size: 12px;
+  display: grid;
+  gap: 4px;
+}
+
+.contract-title {
+  color: #64748b;
+  font-size: 11px;
+}
+
+.contract-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.contract-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 11px;
+  color: #a5b4fc;
+}

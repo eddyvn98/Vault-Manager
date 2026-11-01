@@ -143,10 +143,13 @@ pub fn finalize_wallet_creation(
     let valid_phrase = bip::validate_phrase(&recovery)?;
     let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
 
-    if let Some(pending) = &session.pending_creation {
-        if &**pending != &*valid_phrase {
-            return Err("Provided recovery phrase does not match the generated phrase".into());
-        }
+    let pending = session
+        .pending_creation
+        .as_ref()
+        .ok_or_else(|| "No wallet creation in progress. Please start creation first.".to_string())?;
+
+    if &**pending != &*valid_phrase {
+        return Err("Provided recovery phrase does not match the generated phrase".into());
     }
 
     let bytes = crypto::encrypt(&password, &valid_phrase)?;
@@ -233,6 +236,43 @@ pub fn touch_session(state: State<'_, WalletSession>) -> Result<bool, String> {
     } else {
         Ok(false)
     }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicAddresses {
+    pub btc_mainnet: String,
+    pub btc_signet: String,
+    pub bsc_address: String,
+    pub usdt_bep20_contract: &'static str,
+}
+
+#[tauri::command]
+pub fn get_public_addresses(
+    state: State<'_, WalletSession>,
+) -> Result<PublicAddresses, String> {
+    let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+    if !check_and_apply_auto_lock(&mut session) {
+        return Err("Wallet is locked".into());
+    }
+
+    let mnemonic = session
+        .mnemonic
+        .as_ref()
+        .ok_or_else(|| "Wallet is locked".to_string())?;
+
+    let btc_mainnet = bip::derive_btc_address(mnemonic, bitcoin::Network::Bitcoin)?;
+    let btc_signet = bip::derive_btc_address(mnemonic, bitcoin::Network::Signet)?;
+    let bsc_address = bip::derive_bsc_address(mnemonic)?;
+
+    session.last_activity = Some(Instant::now());
+
+    Ok(PublicAddresses {
+        btc_mainnet,
+        btc_signet,
+        bsc_address,
+        usdt_bep20_contract: bip::USDT_BEP20_CONTRACT,
+    })
 }
 
 /// Secure reset: Requires valid password verification to authenticate the owner before deleting.

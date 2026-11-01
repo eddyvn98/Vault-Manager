@@ -7,6 +7,13 @@ export type WalletStatus = {
   lockoutSeconds: number;
 };
 
+export type PublicAddresses = {
+  btcMainnet: string;
+  btcSignet: string;
+  bscAddress: string;
+  usdtBep20Contract: string;
+};
+
 export type Action = 'create' | 'restore' | 'unlock';
 
 export const offlineStatus: WalletStatus = {
