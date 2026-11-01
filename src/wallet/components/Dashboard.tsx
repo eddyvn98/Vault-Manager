@@ -1,4 +1,4 @@
-import React, { useEffect, useState, useCallback } from 'react';
+import React, { useEffect, useState, useRef, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   ShieldCheck,
@@ -9,7 +9,7 @@ import {
   Check,
   RotateCw,
   Coins,
-  AlertCircle,
+  Info,
 } from 'lucide-react';
 import {
   PublicAddresses,
@@ -32,11 +32,13 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
   const [bscNetwork, setBscNetwork] = useState<'mainnet' | 'testnet'>('mainnet');
   const [busy, setBusy] = useState(false);
 
-  // Balance states
+  // Balance states & race condition protection
+  const btcReqSeq = useRef(0);
   const [btcBalance, setBtcBalance] = useState<BtcBalance | null>(null);
   const [loadingBtcBalance, setLoadingBtcBalance] = useState(false);
   const [btcBalanceError, setBtcBalanceError] = useState<string | null>(null);
 
+  const bscReqSeq = useRef(0);
   const [bscBalance, setBscBalance] = useState<BscBalance | null>(null);
   const [loadingBscBalance, setLoadingBscBalance] = useState(false);
   const [bscBalanceError, setBscBalanceError] = useState<string | null>(null);
@@ -47,41 +49,57 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
   const [resetBusy, setResetBusy] = useState(false);
   const [resetError, setResetError] = useState('');
 
-  // Fetch BTC Balance
+  // Fetch BTC Balance with sequence-id guard against race conditions
   const fetchBtcBalance = useCallback(
     async (addr: string, isSignet: boolean) => {
+      const currentReqId = ++btcReqSeq.current;
       setLoadingBtcBalance(true);
       setBtcBalanceError(null);
+
       try {
         const bal = await invoke<BtcBalance>('query_btc_balance', {
           address: addr,
           signet: isSignet,
         });
-        setBtcBalance(bal);
+        if (currentReqId === btcReqSeq.current) {
+          setBtcBalance(bal);
+        }
       } catch (err) {
-        setBtcBalanceError(getErrorMessage(err));
+        if (currentReqId === btcReqSeq.current) {
+          setBtcBalanceError(getErrorMessage(err));
+        }
       } finally {
-        setLoadingBtcBalance(false);
+        if (currentReqId === btcReqSeq.current) {
+          setLoadingBtcBalance(false);
+        }
       }
     },
     []
   );
 
-  // Fetch BSC Balance
+  // Fetch BSC Balance with sequence-id guard against race conditions
   const fetchBscBalance = useCallback(
     async (addr: string, isTestnet: boolean) => {
+      const currentReqId = ++bscReqSeq.current;
       setLoadingBscBalance(true);
       setBscBalanceError(null);
+
       try {
         const bal = await invoke<BscBalance>('query_bsc_balance', {
           address: addr,
           testnet: isTestnet,
         });
-        setBscBalance(bal);
+        if (currentReqId === bscReqSeq.current) {
+          setBscBalance(bal);
+        }
       } catch (err) {
-        setBscBalanceError(getErrorMessage(err));
+        if (currentReqId === bscReqSeq.current) {
+          setBscBalanceError(getErrorMessage(err));
+        }
       } finally {
-        setLoadingBscBalance(false);
+        if (currentReqId === bscReqSeq.current) {
+          setLoadingBscBalance(false);
+        }
       }
     },
     []
@@ -89,7 +107,7 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
 
   // Initial load of addresses and balances
   useEffect(() => {
-    async function loadAddresses() {
+    async function initDashboard() {
       try {
         const addrs = await invoke<PublicAddresses>('get_public_addresses');
         setAddresses(addrs);
@@ -103,8 +121,8 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
         setLoadingAddrs(false);
       }
     }
-    void loadAddresses();
-  }, [onError, fetchBtcBalance, fetchBscBalance, btcNetwork, bscNetwork]);
+    void initDashboard();
+  }, [onError, fetchBtcBalance, fetchBscBalance]);
 
   const copyToClipboard = (text: string, key: string) => {
     void navigator.clipboard.writeText(text);
@@ -113,14 +131,20 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
   };
 
   const handleBtcNetworkChange = (network: 'mainnet' | 'signet') => {
+    if (network === btcNetwork) return;
     setBtcNetwork(network);
+    setBtcBalance(null);
+    setBtcBalanceError(null);
     if (!addresses) return;
     const addr = network === 'mainnet' ? addresses.btcMainnet : addresses.btcSignet;
     void fetchBtcBalance(addr, network === 'signet');
   };
 
   const handleBscNetworkChange = (network: 'mainnet' | 'testnet') => {
+    if (network === bscNetwork) return;
     setBscNetwork(network);
+    setBscBalance(null);
+    setBscBalanceError(null);
     if (!addresses) return;
     void fetchBscBalance(addresses.bscAddress, network === 'testnet');
   };
@@ -224,7 +248,7 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
                 className="mini-action-btn"
                 disabled={loadingBtcBalance || !activeBtcAddress}
                 onClick={() => activeBtcAddress && fetchBtcBalance(activeBtcAddress, btcNetwork === 'signet')}
-                title="Refresh balance via Esplora API"
+                title="Refresh on-chain balance"
               >
                 <RotateCw size={12} className={loadingBtcBalance ? 'spin' : ''} />
                 Refresh
@@ -243,21 +267,28 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
                 </button>
               </div>
             ) : (
-              <div className="balance-values">
-                <div className="balance-primary">
-                  {loadingBtcBalance && !btcBalance ? 'Loading…' : btcBalance?.formattedBtc ?? '0.00000000'}
-                  <span className="balance-currency">BTC</span>
+              <>
+                <div className="balance-values">
+                  <div className="balance-primary">
+                    {loadingBtcBalance && !btcBalance ? 'Loading…' : btcBalance ? btcBalance.formattedBtc : '—'}
+                    <span className="balance-currency">BTC</span>
+                  </div>
+                  <div className="balance-secondary">
+                    {btcBalance ? `${btcBalance.totalSatoshis.toLocaleString()} sats` : ''}
+                    {btcBalance && btcBalance.unconfirmedSatoshis !== 0 && (
+                      <span className="balance-pending ml-2">
+                        {btcBalance.unconfirmedSatoshis > 0 ? '+' : ''}
+                        {btcBalance.unconfirmedSatoshis.toLocaleString()} mempool
+                      </span>
+                    )}
+                  </div>
                 </div>
-                <div className="balance-secondary">
-                  {btcBalance ? `${btcBalance.totalSatoshis.toLocaleString()} sats` : '0 sats'}
-                  {btcBalance && btcBalance.unconfirmedSatoshis !== 0 && (
-                    <span className="balance-pending ml-2">
-                      {btcBalance.unconfirmedSatoshis > 0 ? '+' : ''}
-                      {btcBalance.unconfirmedSatoshis.toLocaleString()} mempool
-                    </span>
-                  )}
+
+                <div className="text-[11px] text-slate-500 flex items-center gap-1 mt-1">
+                  <Info size={12} />
+                  <span>Showing balance for first receive address (0/0). UTXO aggregation in P2C.</span>
                 </div>
-              </div>
+              </>
             )}
           </div>
         </div>
@@ -275,14 +306,14 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
                 className={`toggle-btn ${bscNetwork === 'mainnet' ? 'active' : ''}`}
                 onClick={() => handleBscNetworkChange('mainnet')}
               >
-                Mainnet
+                Mainnet (56)
               </button>
               <button
                 type="button"
                 className={`toggle-btn ${bscNetwork === 'testnet' ? 'active' : ''}`}
                 onClick={() => handleBscNetworkChange('testnet')}
               >
-                Testnet
+                Testnet (97)
               </button>
             </div>
           </div>
@@ -311,10 +342,12 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
           </div>
 
           <div className="contract-box">
-            <span className="contract-title">Pegged Token:</span>
+            <span className="contract-title">Active Contract:</span>
             <div className="contract-info">
-              <span>Binance-Peg BSC-USD (18 Decimals)</span>
-              <code className="contract-code">{addresses?.usdtBep20Contract}</code>
+              <span>{bscBalance ? bscBalance.usdt.name : (bscNetwork === 'mainnet' ? 'Binance-Peg BSC-USD' : 'BSC Testnet Mock USDT')}</span>
+              <code className="contract-code">
+                {bscBalance?.usdt.contractAddress ?? (bscNetwork === 'mainnet' ? addresses?.usdtBep20Contract : '0x337610d27c682E347C9cD60BD4b3b107C9d34dDd')}
+              </code>
             </div>
           </div>
 
@@ -322,7 +355,7 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
           <div className="balance-box">
             <div className="balance-header">
               <span className="balance-title">
-                <Coins size={14} /> Balances ({bscNetwork === 'mainnet' ? 'BSC Mainnet' : 'BSC Testnet'})
+                <Coins size={14} /> Balances ({bscBalance ? bscBalance.networkName : (bscNetwork === 'mainnet' ? 'BSC Mainnet' : 'BSC Testnet')})
               </span>
               <button
                 type="button"
@@ -350,17 +383,22 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
             ) : (
               <div className="balance-item-grid">
                 <div className="token-subcard">
-                  <span className="token-label">Binance-Peg BSC-USD (USDT)</span>
+                  <span className="token-label">
+                    {bscBalance ? bscBalance.usdt.symbol : 'USDT'} ({bscBalance ? bscBalance.usdt.name : 'Binance-Peg BSC-USD'})
+                  </span>
                   <div className="token-amount">
-                    {loadingBscBalance && !bscBalance ? 'Loading…' : bscBalance?.formattedUsdt ?? '0.0000'}
+                    {loadingBscBalance && !bscBalance ? 'Loading…' : bscBalance ? bscBalance.usdt.formatted : '—'}
                     <span className="balance-currency">USDT</span>
                   </div>
+                  {bscBalance?.usdt.note && (
+                    <span className="text-[10px] text-amber-400">{bscBalance.usdt.note}</span>
+                  )}
                 </div>
 
                 <div className="token-subcard">
-                  <span className="token-label">Gas Token (BNB)</span>
+                  <span className="token-label">Native Gas (BNB)</span>
                   <div className="token-amount bnb-color">
-                    {loadingBscBalance && !bscBalance ? 'Loading…' : bscBalance?.formattedBnb ?? '0.0000'}
+                    {loadingBscBalance && !bscBalance ? 'Loading…' : bscBalance ? bscBalance.formattedBnb : '—'}
                     <span className="balance-currency">BNB</span>
                   </div>
                 </div>

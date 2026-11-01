@@ -15,18 +15,34 @@ export type PublicAddresses = {
 };
 
 export type BtcBalance = {
+  address: string;
+  derivationPath: string;
+  isFirstReceiveAddress: boolean;
   confirmedSatoshis: number;
   unconfirmedSatoshis: number;
   totalSatoshis: number;
   formattedBtc: string;
 };
 
+export type TokenBalance = {
+  symbol: string;
+  name: string;
+  contractAddress?: string;
+  rawHex: string;
+  formatted: string;
+  decimals: number;
+  available: boolean;
+  note?: string;
+};
+
 export type BscBalance = {
+  address: string;
+  derivationPath: string;
+  chainId: number;
+  networkName: string;
   bnbRawWei: string;
   formattedBnb: string;
-  usdtRaw: string;
-  formattedUsdt: string;
-  tokenContract: string;
+  usdt: TokenBalance;
 };
 
 export type Action = 'create' | 'restore' | 'unlock';
