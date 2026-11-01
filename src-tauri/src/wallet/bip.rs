@@ -25,38 +25,51 @@ pub fn validate_phrase(input: &str) -> Result<Zeroizing<String>, String> {
     Ok(Zeroizing::new(m.to_string()))
 }
 
-/// Derive Native SegWit (P2WPKH) Bitcoin address (BIP84).
-/// Mainnet path: m/84'/0'/0'/0/0 -> bc1q...
-/// Signet path: m/84'/1'/0'/0/0 -> tb1q...
-pub fn derive_btc_address(mnemonic: &str, network: Network) -> Result<String, String> {
+/// Derive Native SegWit (P2WPKH) Bitcoin address (BIP84) at specific change and index branch.
+/// Mainnet path: m/84'/0'/0'/{change}/{index}
+/// Signet path: m/84'/1'/0'/{change}/{index}
+pub fn derive_btc_address_at(
+    mnemonic: &str,
+    network: Network,
+    change: u32,
+    index: u32,
+) -> Result<String, String> {
     let m = Mnemonic::parse_in(Language::English, mnemonic.trim())
         .map_err(|_| "Invalid mnemonic phrase")?;
     let seed = m.to_seed("");
     let secp = Secp256k1::new();
 
     let master = Xpriv::new_master(network, &seed).map_err(|e| e.to_string())?;
-    let path_str = match network {
-        Network::Bitcoin => "m/84'/0'/0'/0/0",
-        _ => "m/84'/1'/0'/0/0",
+    let coin_type = match network {
+        Network::Bitcoin => 0,
+        _ => 1,
     };
-    let path = DerivationPath::from_str(path_str).map_err(|e| e.to_string())?;
+    let path_str = format!("m/84'/{}'/0'/{}/{}", coin_type, change, index);
+    let path = DerivationPath::from_str(&path_str).map_err(|e| e.to_string())?;
     let child = master.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
     let secp_pubkey = child.to_priv().inner.public_key(&secp);
     let compressed = bitcoin::CompressedPublicKey(secp_pubkey);
+
     let address = Address::p2wpkh(&compressed, network);
     Ok(address.to_string())
 }
 
-/// Derive BNB Smart Chain (BSC) EVM address using standard BIP44 path (m/44'/60'/0'/0/0)
+pub fn derive_btc_address(mnemonic: &str, network: Network) -> Result<String, String> {
+    derive_btc_address_at(mnemonic, network, 0, 0)
+}
+
+/// Derive BNB Smart Chain (BSC) EVM address at specific address index.
+/// Path: m/44'/60'/0'/0/{index}
 /// Formatted with standard EIP-55 mixed-case checksum.
-pub fn derive_bsc_address(mnemonic: &str) -> Result<String, String> {
+pub fn derive_bsc_address_at(mnemonic: &str, index: u32) -> Result<String, String> {
     let m = Mnemonic::parse_in(Language::English, mnemonic.trim())
         .map_err(|_| "Invalid mnemonic phrase")?;
     let seed = m.to_seed("");
     let secp = Secp256k1::new();
 
     let master = Xpriv::new_master(Network::Bitcoin, &seed).map_err(|e| e.to_string())?;
-    let path = DerivationPath::from_str("m/44'/60'/0'/0/0").map_err(|e| e.to_string())?;
+    let path_str = format!("m/44'/60'/0'/0/{}", index);
+    let path = DerivationPath::from_str(&path_str).map_err(|e| e.to_string())?;
     let child = master.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
     let pubkey = child.to_priv().inner.public_key(&secp);
 
@@ -93,6 +106,10 @@ pub fn derive_bsc_address(mnemonic: &str) -> Result<String, String> {
     Ok(checksummed)
 }
 
+pub fn derive_bsc_address(mnemonic: &str) -> Result<String, String> {
+    derive_bsc_address_at(mnemonic, 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,24 +132,25 @@ mod tests {
     }
 
     #[test]
-    fn derive_btc_and_bsc_addresses_deterministic() {
-        // Standard BIP39 24-word test vector
-        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon art";
+    fn official_bip84_and_evm_test_vectors() {
+        // Official BIP-0084 test vector
+        // https://github.com/bitcoin/bips/blob/master/bip-0084.mediawiki
+        let official_mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
 
-        let btc_main = derive_btc_address(phrase, Network::Bitcoin).unwrap();
-        assert!(btc_main.starts_with("bc1q"), "BTC mainnet address must start with bc1q: {}", btc_main);
+        // First receive address: m/84'/0'/0'/0/0
+        let addr0 = derive_btc_address_at(official_mnemonic, Network::Bitcoin, 0, 0).unwrap();
+        assert_eq!(addr0, "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu", "Must match official BIP84 receive address 0");
 
-        let btc_signet = derive_btc_address(phrase, Network::Signet).unwrap();
-        assert!(btc_signet.starts_with("tb1q"), "BTC signet address must start with tb1q: {}", btc_signet);
+        // Second receive address: m/84'/0'/0'/0/1
+        let addr1 = derive_btc_address_at(official_mnemonic, Network::Bitcoin, 0, 1).unwrap();
+        assert_eq!(addr1, "bc1qnjg0jd8228aq7egyzacy8cys3knf9xvrerkf9g", "Must match official BIP84 receive address 1");
 
-        let bsc = derive_bsc_address(phrase).unwrap();
-        assert!(bsc.starts_with("0x"), "BSC address must start with 0x: {}", bsc);
-        assert_eq!(bsc.len(), 42, "BSC address must be 42 characters (0x + 40 hex)");
+        // First change address: m/84'/0'/0'/1/0
+        let change0 = derive_btc_address_at(official_mnemonic, Network::Bitcoin, 1, 0).unwrap();
+        assert_eq!(change0, "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el", "Must match official BIP84 change address 0");
 
-        // Repeat derivation to verify determinism
-        let btc_main2 = derive_btc_address(phrase, Network::Bitcoin).unwrap();
-        let bsc2 = derive_bsc_address(phrase).unwrap();
-        assert_eq!(btc_main, btc_main2);
-        assert_eq!(bsc, bsc2);
+        // Standard EVM BIP44 m/44'/60'/0'/0/0 test vector
+        let evm0 = derive_bsc_address_at(official_mnemonic, 0).unwrap();
+        assert_eq!(evm0, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94", "Must match official EVM m/44'/60'/0'/0/0 address");
     }
 }

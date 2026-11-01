@@ -14,6 +14,21 @@ export type PublicAddresses = {
   usdtBep20Contract: string;
 };
 
+export type BtcBalance = {
+  confirmedSatoshis: number;
+  unconfirmedSatoshis: number;
+  totalSatoshis: number;
+  formattedBtc: string;
+};
+
+export type BscBalance = {
+  bnbRawWei: string;
+  formattedBnb: string;
+  usdtRaw: string;
+  formattedUsdt: string;
+  tokenContract: string;
+};
+
 export type Action = 'create' | 'restore' | 'unlock';
 
 export const offlineStatus: WalletStatus = {

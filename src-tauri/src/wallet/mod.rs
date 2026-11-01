@@ -1,4 +1,5 @@
 pub mod bip;
+pub mod blockchain;
 pub mod crypto;
 pub mod lockout;
 
@@ -273,6 +274,41 @@ pub fn get_public_addresses(
         bsc_address,
         usdt_bep20_contract: bip::USDT_BEP20_CONTRACT,
     })
+}
+
+#[tauri::command]
+pub fn query_btc_balance(
+    state: State<'_, WalletSession>,
+    address: String,
+    signet: bool,
+) -> Result<blockchain::BtcBalance, String> {
+    let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+    if !check_and_apply_auto_lock(&mut session) {
+        return Err("Wallet is locked".into());
+    }
+    session.last_activity = Some(Instant::now());
+
+    let network = if signet {
+        bitcoin::Network::Signet
+    } else {
+        bitcoin::Network::Bitcoin
+    };
+    blockchain::fetch_btc_balance(&address, network)
+}
+
+#[tauri::command]
+pub fn query_bsc_balance(
+    state: State<'_, WalletSession>,
+    address: String,
+    testnet: bool,
+) -> Result<blockchain::BscBalance, String> {
+    let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+    if !check_and_apply_auto_lock(&mut session) {
+        return Err("Wallet is locked".into());
+    }
+    session.last_activity = Some(Instant::now());
+
+    blockchain::fetch_bsc_balance(&address, testnet)
 }
 
 /// Secure reset: Requires valid password verification to authenticate the owner before deleting.
