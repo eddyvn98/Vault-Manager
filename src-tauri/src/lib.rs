@@ -9,7 +9,8 @@ pub fn run() {
             wallet::create_wallet,
             wallet::restore_wallet,
             wallet::unlock_wallet,
-            wallet::lock_wallet
+            wallet::lock_wallet,
+            wallet::reset_wallet
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Vault Manager local wallet");
