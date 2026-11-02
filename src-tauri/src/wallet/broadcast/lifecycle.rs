@@ -279,6 +279,11 @@ impl TxLifecycleCoordinator {
                     "Broadcast already in progress for draft '{}' (lease #{}, active for {}s): concurrent broadcast rejected",
                     draft_id, existing_token, now_unix.saturating_sub(started_at)
                 ));
+            } else {
+                return Err(format!(
+                    "Previous broadcast attempt for draft '{}' timed out after 60s without completion. Mandatory reconciliation required: query transaction status on-chain before re-attempting broadcast.",
+                    draft_id
+                ));
             }
         }
 
@@ -294,6 +299,13 @@ impl TxLifecycleCoordinator {
 
             if matches!(record.status, TxLifecycleStatus::Pending { .. } | TxLifecycleStatus::Confirmed { .. }) {
                 return Err(format!("Draft '{}' is already in state '{:?}', cannot broadcast again", draft_id, record.status));
+            }
+
+            if matches!(record.status, TxLifecycleStatus::Broadcasting { .. }) && attempt == 1 {
+                return Err(format!(
+                    "Draft '{}' was interrupted in Broadcasting state during crash. Mandatory reconciliation required: poll transaction status before re-attempting broadcast.",
+                    draft_id
+                ));
             }
 
             let expected_txid = record.expected_txid.as_ref().ok_or_else(|| {
@@ -434,6 +446,11 @@ impl TxLifecycleCoordinator {
                     "Broadcast already in progress for draft '{}' (lease #{}, active for {}s): concurrent broadcast rejected",
                     draft_id, existing_token, now_unix.saturating_sub(started_at)
                 ));
+            } else {
+                return Err(format!(
+                    "Previous broadcast attempt for draft '{}' timed out after 60s without completion. Mandatory reconciliation required: query transaction status on-chain before re-attempting broadcast.",
+                    draft_id
+                ));
             }
         }
 
@@ -449,6 +466,13 @@ impl TxLifecycleCoordinator {
 
             if matches!(record.status, TxLifecycleStatus::Pending { .. } | TxLifecycleStatus::Confirmed { .. }) {
                 return Err(format!("Draft '{}' is already in state '{:?}', cannot broadcast again", draft_id, record.status));
+            }
+
+            if matches!(record.status, TxLifecycleStatus::Broadcasting { .. }) && attempt == 1 {
+                return Err(format!(
+                    "Draft '{}' was interrupted in Broadcasting state during crash. Mandatory reconciliation required: poll transaction status before re-attempting broadcast.",
+                    draft_id
+                ));
             }
 
             let expected_sender = record.expected_sender.as_ref().ok_or_else(|| {
@@ -700,6 +724,14 @@ impl TxLifecycleCoordinator {
                     } else {
                         record.status.clone()
                     }
+                } else if matches!(record.status, TxLifecycleStatus::Broadcasting { .. }) {
+                    let failed = TxLifecycleStatus::Failed {
+                        stage: "broadcast".to_string(),
+                        error_message: "Broadcast unconfirmed on-chain: transaction not found in mempool or blocks".to_string(),
+                        permanent: false,
+                    };
+                    record.transition_to(failed.clone(), now_unix)?;
+                    failed
                 } else {
                     record.status.clone()
                 }
@@ -729,6 +761,7 @@ impl TxLifecycleCoordinator {
                             previous_block_hash: prev_hash.clone(),
                         };
                         record.transition_to(reorg.clone(), now_unix)?;
+                        self.active_leases.remove(draft_id);
                         self.persist_if_configured()?;
                         return Ok(reorg);
                     }
@@ -757,6 +790,7 @@ impl TxLifecycleCoordinator {
             }
         };
 
+        self.active_leases.remove(draft_id);
         self.persist_if_configured()?;
         Ok(res)
     }
@@ -807,6 +841,13 @@ impl TxLifecycleCoordinator {
                     };
                     record.transition_to(reorg.clone(), now_unix)?;
                     reorg
+                } else if !matches!(record.status, TxLifecycleStatus::Pending { .. }) {
+                    let pending = TxLifecycleStatus::Pending {
+                        tx_hash: tx_hash.clone(),
+                        first_seen_unix: now_unix,
+                    };
+                    record.transition_to(pending.clone(), now_unix)?;
+                    pending
                 } else {
                     record.status.clone()
                 }
@@ -825,6 +866,7 @@ impl TxLifecycleCoordinator {
                             previous_block_hash: prev_hash.clone(),
                         };
                         record.transition_to(reorg.clone(), now_unix)?;
+                        self.active_leases.remove(draft_id);
                         self.persist_if_configured()?;
                         return Ok(reorg);
                     }
@@ -855,6 +897,7 @@ impl TxLifecycleCoordinator {
             }
         };
 
+        self.active_leases.remove(draft_id);
         self.persist_if_configured()?;
         Ok(res)
     }

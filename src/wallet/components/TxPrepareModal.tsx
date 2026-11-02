@@ -465,7 +465,7 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
               <div className="preview-card border-emerald-500/40 bg-emerald-950/20">
                 <div className="flex items-center gap-2 text-emerald-400 text-xs font-bold mb-1">
                   <ShieldCheck size={16} />
-                  <span>Kết quả Kiểm tra Dry-Run: Giao dịch hợp lệ 100%</span>
+                  <span>Xác minh chữ ký và chính sách thành công — chưa kiểm tra khả năng chấp nhận trên blockchain (mempool/nonce)</span>
                 </div>
                 <div className="text-[11px] text-slate-300 mb-2">
                   Trạng thái bảo toàn: <span className="font-mono text-emerald-300 font-semibold">{preflightReport.status}</span> (Chưa phát sóng lên mạng, an toàn tuyệt đối).

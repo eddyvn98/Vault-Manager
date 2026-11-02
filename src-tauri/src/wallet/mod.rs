@@ -2866,4 +2866,180 @@ mod tests {
         std::env::remove_var("VAULT_ENABLE_TESTNET_BROADCAST");
         assert!(!session.is_live_broadcast_allowed());
     }
+
+    #[test]
+    fn test_t75_lease_expiration_reconciliation_and_thread_concurrency() {
+        use crate::wallet::broadcast::{
+            btc::{BtcTxQueryStatus, MockBtcBroadcaster},
+            types::{BroadcastNetwork, TxLifecycleStatus},
+        };
+        use std::sync::{Arc, Barrier, Mutex};
+        use std::thread;
+
+        let temp_storage = std::env::temp_dir().join(format!("t75_coord_{}.json", LockoutManager::now_unix()));
+        let mut coord = broadcast::lifecycle::TxLifecycleCoordinator::default();
+        coord.set_storage_path(temp_storage.clone());
+        let now_unix = LockoutManager::now_unix();
+        let draft_id = "draft-btc-t75-multithread";
+
+        // Register and mark signed
+        coord.register_draft(draft_id, BroadcastNetwork::BitcoinSignet, now_unix).unwrap();
+        coord.record_signed_btc(
+            draft_id,
+            "0x7575",
+            "0200000001...",
+            "txid_t75",
+            "wtxid_t75",
+            vec![broadcast::types::ApprovedPrevout {
+                txid: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                vout: 0,
+                value_satoshis: 25_000,
+                script_pubkey_hex: "0014...".into(),
+            }],
+            now_unix,
+        ).unwrap();
+
+        let coord_arc = Arc::new(Mutex::new(coord));
+        let barrier = Arc::new(Barrier::new(2));
+
+        // Spawn 2 threads racing to call begin_broadcast_btc simultaneously
+        let handle1 = {
+            let c = Arc::clone(&coord_arc);
+            let b = Arc::clone(&barrier);
+            let d = draft_id.to_string();
+            thread::spawn(move || {
+                b.wait();
+                c.lock().unwrap().begin_broadcast_btc(&d, 1, now_unix)
+            })
+        };
+
+        let handle2 = {
+            let c = Arc::clone(&coord_arc);
+            let b = Arc::clone(&barrier);
+            let d = draft_id.to_string();
+            thread::spawn(move || {
+                b.wait();
+                c.lock().unwrap().begin_broadcast_btc(&d, 1, now_unix)
+            })
+        };
+
+        let res1 = handle1.join().unwrap();
+        let res2 = handle2.join().unwrap();
+
+        // Exactly one thread succeeds, and the other fails-closed with concurrent rejection
+        let (success_res, failed_res) = match (res1, res2) {
+            (Ok(ctx), Err(err)) => (ctx, err),
+            (Err(err), Ok(ctx)) => (ctx, err),
+            (Ok(_), Ok(_)) => panic!("Critical race condition: both threads obtained exclusive lease!"),
+            (Err(e1), Err(e2)) => panic!("Both threads failed unexpectedly: {}, {}", e1, e2),
+        };
+
+        assert!(failed_res.contains("concurrent broadcast rejected"));
+        assert_eq!(success_res.lease_token, 1);
+
+        // PART 2: Lease Expiration Reconciliation
+        // Simulate lease expiration (>60s) where request was hung or dropped
+        let expired_now = now_unix + 61;
+        let mut coord_guard = coord_arc.lock().unwrap();
+
+        // Resubmitting without reconciliation MUST be rejected fail-closed!
+        let resubmit_res = coord_guard.begin_broadcast_btc(draft_id, 1, expired_now);
+        assert!(resubmit_res.is_err(), "Resubmit after timeout must require mandatory reconciliation");
+        let err_msg = resubmit_res.unwrap_err();
+        assert!(
+            err_msg.contains("timed out after 60s without completion. Mandatory reconciliation required"),
+            "Error must enforce reconciliation: {}",
+            err_msg
+        );
+
+        // Perform mandatory reconciliation via poll_btc_lifecycle
+        let mock_broadcaster = MockBtcBroadcaster::new();
+        mock_broadcaster.set_tx_status("txid_t75", BtcTxQueryStatus::InMempool);
+
+        let reconciled_status = coord_guard.poll_btc_lifecycle(draft_id, &mock_broadcaster, expired_now + 1).unwrap();
+        assert!(matches!(reconciled_status, TxLifecycleStatus::Pending { .. }));
+
+        // Now that reconciliation has transitioned the record to Pending, active lease is cleared
+        assert!(!coord_guard.active_leases.contains_key(draft_id));
+
+        // And further begin_broadcast_btc is rejected because transaction is already Pending
+        let after_reconciliation = coord_guard.begin_broadcast_btc(draft_id, 1, expired_now + 2);
+        assert!(after_reconciliation.is_err());
+        assert!(after_reconciliation.unwrap_err().contains("already in state"));
+
+        let _ = fs::remove_file(temp_storage);
+    }
+
+    #[test]
+    fn test_t76_crash_restart_reconciliation_poll_before_resubmit() {
+        use crate::wallet::broadcast::{
+            btc::{BtcTxQueryStatus, MockBtcBroadcaster},
+            types::{BroadcastNetwork, TxLifecycleStatus},
+        };
+
+        let temp_storage = std::env::temp_dir().join(format!("t76_coord_{}.json", LockoutManager::now_unix()));
+        let now_unix = LockoutManager::now_unix();
+        let draft_id = "draft-btc-t76-crash-recovery";
+
+        // 1. Initial process: register, sign, and begin broadcast
+        {
+            let mut coord = broadcast::lifecycle::TxLifecycleCoordinator::default();
+            coord.set_storage_path(temp_storage.clone());
+            coord.register_draft(draft_id, BroadcastNetwork::BitcoinSignet, now_unix).unwrap();
+            coord.record_signed_btc(
+                draft_id,
+                "0x7676",
+                "0200000001...",
+                "txid_t76",
+                "wtxid_t76",
+                vec![broadcast::types::ApprovedPrevout {
+                    txid: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                    vout: 0,
+                    value_satoshis: 35_000,
+                    script_pubkey_hex: "0014...".into(),
+                }],
+                now_unix,
+            ).unwrap();
+
+            // begin_broadcast transitions status to Broadcasting and persists to storage
+            let _ctx = coord.begin_broadcast_btc(draft_id, 1, now_unix).unwrap();
+            let rec = coord.get_record(draft_id).unwrap();
+            assert!(matches!(rec.status, TxLifecycleStatus::Broadcasting { .. }));
+            // Process crashes here before complete_broadcast can be called!
+        }
+
+        // 2. Restart simulation: new coordinator instance loads persisted state from disk
+        let mut recovered_coord = broadcast::lifecycle::TxLifecycleCoordinator::load_from_file(&temp_storage).unwrap();
+        // Storage path is preserved
+        assert_eq!(recovered_coord.storage_path, Some(temp_storage.clone()));
+        // Record is loaded in Broadcasting state
+        let rec = recovered_coord.get_record(draft_id).unwrap();
+        assert!(matches!(rec.status, TxLifecycleStatus::Broadcasting { .. }));
+        // Active lease map in memory is empty after crash
+        assert!(recovered_coord.active_leases.is_empty());
+
+        // 3. Resubmit attempt without prior reconciliation MUST FAIL-CLOSED!
+        let resubmit_res = recovered_coord.begin_broadcast_btc(draft_id, 1, now_unix + 10);
+        assert!(resubmit_res.is_err(), "Resubmit after crash must fail-closed");
+        let err_msg = resubmit_res.unwrap_err();
+        assert!(
+            err_msg.contains("was interrupted in Broadcasting state during crash. Mandatory reconciliation required"),
+            "Error message must specify crash reconciliation requirement: {}",
+            err_msg
+        );
+
+        // 4. Perform mandatory reconciliation polling
+        let mock_broadcaster = MockBtcBroadcaster::new();
+        mock_broadcaster.set_tx_status("txid_t76", BtcTxQueryStatus::InMempool);
+
+        let reconciled_status = recovered_coord.poll_btc_lifecycle(draft_id, &mock_broadcaster, now_unix + 15).unwrap();
+        assert!(matches!(reconciled_status, TxLifecycleStatus::Pending { .. }));
+
+        // 5. Verify reconciled state was auto-persisted: load a 3rd coordinator instance to confirm
+        let reloaded_coord = broadcast::lifecycle::TxLifecycleCoordinator::load_from_file(&temp_storage).unwrap();
+        let reloaded_rec = reloaded_coord.get_record(draft_id).unwrap();
+        assert!(matches!(reloaded_rec.status, TxLifecycleStatus::Pending { .. }));
+
+        let _ = fs::remove_file(temp_storage);
+    }
 }
