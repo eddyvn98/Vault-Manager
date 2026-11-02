@@ -214,6 +214,18 @@ impl EsploraBtcBroadcaster {
         let computed_txid = tx.compute_txid().to_string();
         Ok((tx, computed_txid))
     }
+
+    /// Verifies that the raw transaction txid strictly matches the approved draft txid before broadcasting
+    pub fn broadcast_verified(&self, raw_tx_hex: &str, expected_txid: &str, network: BroadcastNetwork) -> Result<String, BtcBroadcastError> {
+        let (_tx, computed_txid) = self.dry_run_verify(raw_tx_hex, network)?;
+        if computed_txid != expected_txid {
+            return Err(BtcBroadcastError::NodeRejected(format!(
+                "Raw transaction txid '{}' does not match approved transaction txid '{}'",
+                computed_txid, expected_txid
+            )));
+        }
+        self.broadcast(raw_tx_hex, network)
+    }
 }
 
 impl BtcBroadcaster for EsploraBtcBroadcaster {

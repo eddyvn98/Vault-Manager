@@ -565,7 +565,9 @@ pub async fn prepare_btc_transaction(
         .path()
         .app_data_dir()
         .map_err(|e| format!("Failed to resolve app data directory: {}", e))?;
-    let db_path = app_dir.join("bdk_signet.sqlite3");
+    let db_dir = app_dir.join("bdk_signet_db");
+    let _ = fs::create_dir_all(&db_dir);
+    let db_path = db_dir.join("bdk_signet.sqlite3");
 
     let preview =
         tx::btc::prepare::prepare_signet_tx(&mnemonic, &recipient, amount_satoshis, fee_rate_sat_vb, Some(&db_path))
@@ -680,37 +682,37 @@ pub fn cleanup_sqlite_files(app_dir: &std::path::Path) -> Result<(), String> {
         }
     }
 
+    // 2. Atomic Directory Staging: If the dedicated DB directory exists, atomically rename the entire directory
+    let bdk_db_dir = app_dir.join("bdk_signet_db");
+    if bdk_db_dir.exists() {
+        let now = LockoutManager::now_unix();
+        let staging_dir = app_dir.join(format!(".sqlite_staging_dir_{}", now));
+        fs::rename(&bdk_db_dir, &staging_dir)
+            .map_err(|e| format!("Cannot atomically stage SQLite database directory for deletion: {}", e))?;
+        fs::remove_dir_all(&staging_dir)
+            .map_err(|e| format!("Cannot purge staged SQLite database directory: {}", e))?;
+    }
+
+    // 3. Fallback: Also clean up any legacy loose database/journal files
     let bdk_db = app_dir.join("bdk_signet.sqlite3");
     let bdk_wal = app_dir.join("bdk_signet.sqlite3-wal");
     let bdk_shm = app_dir.join("bdk_signet.sqlite3-shm");
 
-    // If nothing exists, nothing to do
-    if !bdk_db.exists() && !bdk_wal.exists() && !bdk_shm.exists() {
-        return Ok(());
+    if bdk_db.exists() || bdk_wal.exists() || bdk_shm.exists() {
+        let now = LockoutManager::now_unix();
+        let staging_dir = app_dir.join(format!(".sqlite_staging_loose_{}", now));
+        let _ = fs::create_dir_all(&staging_dir);
+        if bdk_db.exists() {
+            let _ = fs::rename(&bdk_db, staging_dir.join("bdk_signet.sqlite3"));
+        }
+        if bdk_wal.exists() {
+            let _ = fs::rename(&bdk_wal, staging_dir.join("bdk_signet.sqlite3-wal"));
+        }
+        if bdk_shm.exists() {
+            let _ = fs::rename(&bdk_shm, staging_dir.join("bdk_signet.sqlite3-shm"));
+        }
+        let _ = fs::remove_dir_all(&staging_dir);
     }
-
-    // 2. Atomic staging: create a staging directory and move all database files into it
-    let now = LockoutManager::now_unix();
-    let staging_dir = app_dir.join(format!(".sqlite_staging_{}", now));
-    fs::create_dir_all(&staging_dir).map_err(|e| format!("Cannot create SQLite staging directory: {}", e))?;
-
-    // Attempt to atomically move files into staging directory
-    if bdk_db.exists() {
-        fs::rename(&bdk_db, staging_dir.join("bdk_signet.sqlite3"))
-            .map_err(|e| format!("Cannot stage SQLite database for deletion: {}", e))?;
-    }
-    if bdk_wal.exists() {
-        fs::rename(&bdk_wal, staging_dir.join("bdk_signet.sqlite3-wal"))
-            .map_err(|e| format!("Cannot stage SQLite WAL for deletion: {}", e))?;
-    }
-    if bdk_shm.exists() {
-        fs::rename(&bdk_shm, staging_dir.join("bdk_signet.sqlite3-shm"))
-            .map_err(|e| format!("Cannot stage SQLite SHM for deletion: {}", e))?;
-    }
-
-    // 3. Purge the staging directory
-    fs::remove_dir_all(&staging_dir)
-        .map_err(|e| format!("Cannot purge staged SQLite files: {}", e))?;
 
     Ok(())
 }

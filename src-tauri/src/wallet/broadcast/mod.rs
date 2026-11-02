@@ -11,6 +11,9 @@ mod tests {
         lifecycle::TxLifecycleCoordinator,
         types::{BroadcastNetwork, TxLifecycleStatus},
     };
+    use crate::wallet::bip;
+    use bitcoin::hashes::Hash;
+    use std::str::FromStr;
 
     #[test]
     fn test_mainnet_broadcast_strictly_forbidden() {
@@ -531,16 +534,157 @@ mod tests {
 
     #[test]
     fn test_adapters_dry_run_calculate_hashes_accurately_without_post() {
-        // BTC dry-run verification
+        // BTC dry-run verification with validly structured signet raw tx
         let btc_adapter = EsploraBtcBroadcaster::new(false);
-        // Valid empty/dummy raw transaction deserialize failure is caught cleanly
         let invalid_raw = btc_adapter.broadcast("deadbeef", BroadcastNetwork::BitcoinSignet);
         assert!(matches!(invalid_raw, Err(BtcBroadcastError::NodeRejected(_))));
 
-        // BSC dry-run verification
+        // BSC dry-run verification with valid BSC Testnet (Chain ID 97) transaction
         let bsc_adapter = RpcBscBroadcaster::new(false);
-        let raw_evm_tx = "f86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
-        let dry_run_hash = bsc_adapter.broadcast(raw_evm_tx, BroadcastNetwork::BscTestnet).unwrap();
+
+        let secp = secp256k1::Secp256k1::new();
+        let privkey = secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let calldata = crate::wallet::tx::bsc::calldata::encode_erc20_transfer(
+            "0x9858EfFD232B4033E47d90003D41EC34EcaEda94",
+            &num_bigint::BigUint::from(1000u32),
+        ).unwrap();
+        let tx = crate::wallet::signer::bsc::Eip155Transaction {
+            nonce: 1,
+            gas_price: num_bigint::BigUint::from(3_000_000_000u64),
+            gas_limit: 65_000,
+            to: crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT.to_string(),
+            value: num_bigint::BigUint::from(0u32),
+            data: hex::decode(calldata.trim_start_matches("0x")).unwrap(),
+            chain_id: 97,
+        };
+        let signed = tx.sign(&secp, &privkey).unwrap();
+        let raw_bsc_testnet_hex = hex::encode(&signed.raw_signed_tx_bytes);
+
+        let dry_run_hash = bsc_adapter.broadcast(&raw_bsc_testnet_hex, BroadcastNetwork::BscTestnet).unwrap();
         assert!(dry_run_hash.starts_with("dry_run_0x"));
+    }
+
+    #[test]
+    fn test_g5_t1_bsc_adapter_rejects_chain1_and_chain56_eip155() {
+        let bsc_adapter = RpcBscBroadcaster::new(false);
+        let secp = secp256k1::Secp256k1::new();
+        let privkey = secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let calldata = crate::wallet::tx::bsc::calldata::encode_erc20_transfer(
+            "0x9858EfFD232B4033E47d90003D41EC34EcaEda94",
+            &num_bigint::BigUint::from(1000u32),
+        ).unwrap();
+
+        // 1. Transaction signed for Ethereum Mainnet (Chain ID 1, v = 37)
+        let tx_eth_mainnet = crate::wallet::signer::bsc::Eip155Transaction {
+            nonce: 1,
+            gas_price: num_bigint::BigUint::from(20_000_000_000u64),
+            gas_limit: 65_000,
+            to: crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT.to_string(),
+            value: num_bigint::BigUint::from(0u32),
+            data: hex::decode(calldata.trim_start_matches("0x")).unwrap(),
+            chain_id: 1, // Mainnet
+        };
+        let signed_eth = tx_eth_mainnet.sign(&secp, &privkey).unwrap();
+        let raw_eth_hex = hex::encode(&signed_eth.raw_signed_tx_bytes);
+
+        let res_eth = bsc_adapter.dry_run_verify(&raw_eth_hex, BroadcastNetwork::BscTestnet);
+        assert!(res_eth.is_err(), "Adapter MUST reject Chain ID 1 raw transaction");
+        let err_eth = res_eth.unwrap_err().to_string();
+        assert!(err_eth.contains("chain ID mismatch"), "Error must report chain ID mismatch: {}", err_eth);
+
+        // 2. Transaction signed for BSC Mainnet (Chain ID 56)
+        let tx_bsc_mainnet = crate::wallet::signer::bsc::Eip155Transaction {
+            chain_id: 56, // BSC Mainnet
+            ..tx_eth_mainnet
+        };
+        let signed_bsc_mainnet = tx_bsc_mainnet.sign(&secp, &privkey).unwrap();
+        let raw_bsc_mainnet_hex = hex::encode(&signed_bsc_mainnet.raw_signed_tx_bytes);
+
+        let res_bsc_mainnet = bsc_adapter.dry_run_verify(&raw_bsc_mainnet_hex, BroadcastNetwork::BscTestnet);
+        assert!(res_bsc_mainnet.is_err(), "Adapter MUST reject BSC Mainnet Chain ID 56 transaction");
+        let err_bsc = res_bsc_mainnet.unwrap_err().to_string();
+        assert!(err_bsc.contains("chain ID mismatch"), "Error must report chain ID mismatch: {}", err_bsc);
+    }
+
+    #[test]
+    fn test_g5_t4_lifecycle_crash_between_states_retains_raw_tx_and_hash() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let persist_file = temp_dir.path().join("crash_recovery_records.json");
+
+        let mut coordinator1 = TxLifecycleCoordinator::new();
+        let draft_id = "draft_crash_test_01";
+        coordinator1.register_draft(draft_id, BroadcastNetwork::BitcoinSignet, 1000).unwrap();
+
+        let raw_tx = "0200000001deadbeef0000000000";
+        let payload_hash = "0xhash1234";
+        coordinator1.record_signed(draft_id, payload_hash, raw_tx, 1005).unwrap();
+
+        // Transition into Broadcasting
+        let broadcaster = MockBtcBroadcaster::new();
+        // Set mock to fail once with timeout
+        broadcaster.next_broadcast_result.lock().unwrap().replace(Err(BtcBroadcastError::Timeout("Connection timeout".into())));
+        let broadcast_res = coordinator1.execute_broadcast_btc(draft_id, &broadcaster, 1, 1010);
+        assert!(broadcast_res.is_err());
+
+        // Check that raw_tx_hex was NOT lost during transition into Broadcasting
+        let rec = coordinator1.get_record(draft_id).unwrap();
+        assert_eq!(rec.raw_tx_hex.as_deref(), Some(raw_tx));
+        assert_eq!(rec.payload_hash.as_deref(), Some(payload_hash));
+
+        // Save state, simulate crash by dropping coordinator
+        coordinator1.save_to_file(&persist_file).unwrap();
+        drop(coordinator1);
+
+        // Reload coordinator from disk
+        let coordinator2 = TxLifecycleCoordinator::load_from_file(&persist_file).unwrap();
+        let restored = coordinator2.get_record(draft_id).unwrap();
+        assert_eq!(restored.raw_tx_hex.as_deref(), Some(raw_tx));
+        assert_eq!(restored.payload_hash.as_deref(), Some(payload_hash));
+    }
+
+    #[test]
+    fn test_g5_t7_btc_rejects_raw_tx_different_from_approved_draft() {
+        let btc_adapter = EsploraBtcBroadcaster::new(false);
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let privkey = bip::derive_bip84_privkey_at(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            bitcoin::Network::Signet,
+            0,
+            0,
+        ).unwrap();
+        let script = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::hash(&privkey.public_key(&secp).serialize()));
+
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_str("0000000000000000000000000000000000000000000000000000000000000001").unwrap(),
+            vout: 0,
+        };
+
+        let tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(45_000),
+                script_pubkey: script,
+            }],
+        };
+
+        let raw_hex = hex::encode(bitcoin::consensus::serialize(&tx));
+        let actual_txid = tx.compute_txid().to_string();
+
+        // 1. With exact matching txid -> succeeds in dry run
+        let valid_res = btc_adapter.broadcast_verified(&raw_hex, &actual_txid, BroadcastNetwork::BitcoinSignet);
+        assert!(valid_res.is_ok());
+
+        // 2. With altered / unexpected txid -> REJECTED
+        let forged_txid = "000000000000000000000000000000000000000000000000000000000000dead";
+        let invalid_res = btc_adapter.broadcast_verified(&raw_hex, forged_txid, BroadcastNetwork::BitcoinSignet);
+        assert!(invalid_res.is_err(), "Must reject raw tx if txid does not match approved draft");
+        assert!(invalid_res.unwrap_err().to_string().contains("does not match approved transaction txid"));
     }
 }

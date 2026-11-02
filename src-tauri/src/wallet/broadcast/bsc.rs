@@ -184,6 +184,76 @@ impl BscBroadcaster for MockBscBroadcaster {
     }
 }
 
+/// Minimal safe RLP list parser for legacy EIP-155 transactions.
+/// Returns a vector of raw item bytes contained in the RLP list.
+pub fn parse_rlp_list(payload: &[u8]) -> Result<Vec<Vec<u8>>, String> {
+    if payload.is_empty() {
+        return Err("Empty RLP payload".into());
+    }
+
+    let first = payload[0];
+    let (list_payload, _consumed) = if (0xc0..=0xf7).contains(&first) {
+        let len = (first - 0xc0) as usize;
+        if payload.len() < 1 + len {
+            return Err("RLP list payload truncated".into());
+        }
+        (&payload[1..1 + len], 1 + len)
+    } else if first >= 0xf8 {
+        let len_of_len = (first - 0xf7) as usize;
+        if payload.len() < 1 + len_of_len {
+            return Err("RLP list length header truncated".into());
+        }
+        let mut len = 0usize;
+        for &b in &payload[1..1 + len_of_len] {
+            len = (len << 8) | (b as usize);
+        }
+        if payload.len() < 1 + len_of_len + len {
+            return Err("RLP list payload truncated".into());
+        }
+        (&payload[1 + len_of_len..1 + len_of_len + len], 1 + len_of_len + len)
+    } else {
+        return Err("Expected RLP list header (0xc0..0xff)".into());
+    };
+
+    let mut items = Vec::new();
+    let mut cursor = 0;
+    while cursor < list_payload.len() {
+        let b = list_payload[cursor];
+        if b <= 0x7f {
+            items.push(vec![b]);
+            cursor += 1;
+        } else if (0x80..=0xb7).contains(&b) {
+            let item_len = (b - 0x80) as usize;
+            cursor += 1;
+            if cursor + item_len > list_payload.len() {
+                return Err("RLP string item truncated".into());
+            }
+            items.push(list_payload[cursor..cursor + item_len].to_vec());
+            cursor += item_len;
+        } else if (0xb8..=0xbf).contains(&b) {
+            let len_of_len = (b - 0xb7) as usize;
+            cursor += 1;
+            if cursor + len_of_len > list_payload.len() {
+                return Err("RLP string length truncated".into());
+            }
+            let mut item_len = 0usize;
+            for &lb in &list_payload[cursor..cursor + len_of_len] {
+                item_len = (item_len << 8) | (lb as usize);
+            }
+            cursor += len_of_len;
+            if cursor + item_len > list_payload.len() {
+                return Err("RLP string item truncated".into());
+            }
+            items.push(list_payload[cursor..cursor + item_len].to_vec());
+            cursor += item_len;
+        } else {
+            return Err("Nested lists are not expected inside legacy EIP-155 transaction".into());
+        }
+    }
+
+    Ok(items)
+}
+
 /// Real network adapter for BSC Testnet using JSON-RPC.
 /// Strictly enforces testnet boundaries and feature-locking (G5A/G5B).
 #[allow(dead_code)]
@@ -212,8 +282,9 @@ impl RpcBscBroadcaster {
         }
     }
 
-    /// Dry-run verification (G5A): calculates Keccak-256 transaction hash locally,
-    /// verifies network is BSC Testnet, without sending eth_sendRawTransaction.
+    /// Dry-run verification (G5A): Decodes RLP, parses EIP-155 signature fields,
+    /// verifies chain ID 97, recipient contract, zero value, and ERC-20 selector,
+    /// and calculates Keccak-256 hash without sending eth_sendRawTransaction.
     pub fn dry_run_verify(&self, raw_tx_hex: &str, network: BroadcastNetwork) -> Result<String, BscBroadcastError> {
         if network != BroadcastNetwork::BscTestnet {
             return Err(BscBroadcastError::NetworkForbidden(
@@ -229,6 +300,58 @@ impl RpcBscBroadcaster {
             return Err(BscBroadcastError::RpcError { code: -32602, message: "Raw transaction bytes are empty".to_string() });
         }
 
+        // Parse RLP items
+        let items = parse_rlp_list(&raw_bytes)
+            .map_err(|e| BscBroadcastError::RpcError { code: -32602, message: format!("Failed to parse EIP-155 RLP list: {}", e) })?;
+
+        if items.len() != 9 {
+            return Err(BscBroadcastError::RpcError {
+                code: -32602,
+                message: format!("Expected 9 RLP items for EIP-155 transaction, got {}", items.len()),
+            });
+        }
+
+        // Item 6: v (must decode to chain_id = 97)
+        let mut v = 0u64;
+        for &b in &items[6] {
+            v = (v << 8) | (b as u64);
+        }
+        if v < 35 {
+            return Err(BscBroadcastError::NetworkForbidden(
+                "Legacy transaction lacks EIP-155 replay protection (v < 35)".to_string(),
+            ));
+        }
+        let chain_id = (v - 35) / 2;
+        if chain_id != 97 {
+            return Err(BscBroadcastError::NetworkForbidden(
+                format!("EIP-155 chain ID mismatch in raw transaction: expected 97 (BSC Testnet), found {}", chain_id),
+            ));
+        }
+
+        // Item 3: to address (must match testnet USDT contract)
+        let to_hex = format!("0x{}", hex::encode(&items[3]));
+        if to_hex.to_lowercase() != crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT.to_lowercase() {
+            return Err(BscBroadcastError::NetworkForbidden(
+                format!("Unauthorized recipient contract: expected {}, got {}", crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT, to_hex),
+            ));
+        }
+
+        // Item 4: value (must be strictly 0 for token transfers)
+        if !items[4].is_empty() && items[4].iter().any(|&b| b != 0) {
+            return Err(BscBroadcastError::RpcError {
+                code: -32602,
+                message: "Transaction value must be 0 for token transfers".to_string(),
+            });
+        }
+
+        // Item 5: data (must start with ERC20 transfer selector 0xa9059cbb)
+        if items[5].len() < 4 || items[5][0..4] != [0xa9, 0x05, 0x9c, 0xbb] {
+            return Err(BscBroadcastError::RpcError {
+                code: -32602,
+                message: "Transaction calldata does not match ERC-20 transfer selector (0xa9059cbb)".to_string(),
+            });
+        }
+
         let mut hasher = Keccak::v256();
         let mut hash = [0u8; 32];
         hasher.update(&raw_bytes);
@@ -237,12 +360,71 @@ impl RpcBscBroadcaster {
         Ok(computed_hash)
     }
 
-    /// Dry-run query: queries nonce and balance via JSON-RPC
+    /// Dry-run query: strictly parses nonce and balance via JSON-RPC without unwrap_or(0) defaults
     pub fn dry_run_query_account(&self, address: &str) -> Result<(u64, String), BscBroadcastError> {
         let nonce_val = self.call_rpc("eth_getTransactionCount", serde_json::json!([address, "latest"]))?;
-        let nonce = u64::from_str_radix(nonce_val.trim_start_matches("0x"), 16).unwrap_or(0);
+        let clean_nonce = nonce_val.trim().trim_start_matches("0x").trim_start_matches("0X");
+        if clean_nonce.is_empty() {
+            return Err(BscBroadcastError::RpcError { code: -32603, message: "RPC returned empty nonce".to_string() });
+        }
+        let nonce = u64::from_str_radix(clean_nonce, 16)
+            .map_err(|e| BscBroadcastError::RpcError { code: -32603, message: format!("Invalid nonce hex from RPC: {}", e) })?;
+
         let balance_hex = self.call_rpc("eth_getBalance", serde_json::json!([address, "latest"]))?;
+        let clean_balance = balance_hex.trim();
+        if clean_balance.is_empty() || clean_balance == "null" || !clean_balance.starts_with("0x") {
+            return Err(BscBroadcastError::RpcError { code: -32603, message: format!("RPC returned invalid balance: {}", balance_hex) });
+        }
         Ok((nonce, balance_hex))
+    }
+
+    /// Queries mempool and receipt status, distinguishing Pending in mempool from unknown/not-found
+    pub fn query_mempool_or_receipt(&self, tx_hash: &str) -> Result<BscReceiptStatus, BscBroadcastError> {
+        let formatted_hash = if tx_hash.starts_with("0x") {
+            tx_hash.to_string()
+        } else {
+            format!("0x{}", tx_hash)
+        };
+
+        // 1. First check if a receipt already exists (mined block)
+        let receipt_str = self.call_rpc("eth_getTransactionReceipt", serde_json::json!([formatted_hash]))?;
+        if receipt_str != "null" && !receipt_str.trim().is_empty() {
+            let receipt: serde_json::Value = serde_json::from_str(&receipt_str)
+                .map_err(|e| BscBroadcastError::RpcError { code: -32700, message: format!("Cannot parse receipt JSON: {}", e) })?;
+
+            let status_hex = receipt.get("status").and_then(|v| v.as_str()).unwrap_or("0x0");
+            let block_number_hex = receipt.get("blockNumber").and_then(|v| v.as_str()).unwrap_or("0x0");
+            let block_number = u64::from_str_radix(block_number_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+            let block_hash = receipt.get("blockHash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let gas_used_hex = receipt.get("gasUsed").and_then(|v| v.as_str()).unwrap_or("0x0");
+            let gas_used = u64::from_str_radix(gas_used_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+
+            if status_hex == "0x1" {
+                return Ok(BscReceiptStatus::Success {
+                    block_number,
+                    block_hash,
+                    gas_used,
+                });
+            } else {
+                return Ok(BscReceiptStatus::Reverted {
+                    block_number,
+                    block_hash,
+                    reason: "EVM execution reverted (status 0x0)".to_string(),
+                });
+            }
+        }
+
+        // 2. Receipt is null -> Query eth_getTransactionByHash to see if node has it in mempool
+        let tx_str = self.call_rpc("eth_getTransactionByHash", serde_json::json!([formatted_hash]))?;
+        if tx_str != "null" && !tx_str.trim().is_empty() {
+            return Ok(BscReceiptStatus::Pending);
+        }
+
+        // 3. Not found in receipt AND not found in mempool -> Unknown!
+        Err(BscBroadcastError::Timeout(format!(
+            "Transaction '{}' was not found in mempool or block receipts. Status unknown.",
+            tx_hash
+        )))
     }
 
     fn call_rpc(&self, method: &str, params: serde_json::Value) -> Result<String, BscBroadcastError> {
@@ -300,12 +482,12 @@ impl BscBroadcaster for RpcBscBroadcaster {
         let res = match self.call_rpc("eth_sendRawTransaction", serde_json::json!([formatted_hex])) {
             Ok(h) => h,
             Err(e) => {
-                // If timeout occurred, DO NOT immediately retry or duplicate:
-                // First query receipt/mempool for the expected transaction hash!
-                if let Ok(BscReceiptStatus::Success { .. } | BscReceiptStatus::Pending) = self.query_receipt(&computed_hash, network) {
-                    return Ok(computed_hash);
+                // If timeout or failure occurred, DO NOT immediately retry or duplicate:
+                // Check if node actually has the transaction in mempool or block
+                match self.query_mempool_or_receipt(&computed_hash) {
+                    Ok(BscReceiptStatus::Success { .. } | BscReceiptStatus::Pending) => computed_hash.clone(),
+                    _ => return Err(e),
                 }
-                return Err(e);
             }
         };
 

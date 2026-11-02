@@ -157,6 +157,8 @@ pub struct TxLifecycleRecord {
     pub record_id: String,
     pub network: BroadcastNetwork,
     pub tx_hash: Option<String>,
+    pub raw_tx_hex: Option<String>,
+    pub payload_hash: Option<String>,
     pub status: TxLifecycleStatus,
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
@@ -170,6 +172,8 @@ impl TxLifecycleRecord {
             record_id: draft_id.clone(),
             network,
             tx_hash: None,
+            raw_tx_hex: None,
+            payload_hash: None,
             status: TxLifecycleStatus::DraftCreated { draft_id },
             created_at_unix: now_unix,
             updated_at_unix: now_unix,
@@ -185,8 +189,12 @@ impl TxLifecycleRecord {
             ));
         }
 
-        // Track tx_hash if entering Pending or Confirmed
+        // Track critical payload and tx identifiers across transitions
         match &next_status {
+            TxLifecycleStatus::Signed { payload_hash, raw_tx_hex, .. } => {
+                self.payload_hash = Some(payload_hash.clone());
+                self.raw_tx_hex = Some(raw_tx_hex.clone());
+            }
             TxLifecycleStatus::Pending { tx_hash, .. } => {
                 self.tx_hash = Some(tx_hash.clone());
             }

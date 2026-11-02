@@ -58,8 +58,15 @@ impl TxLifecycleCoordinator {
         }
 
         let temp_path = path.with_extension(format!("tmp.{}", rand::random::<u32>()));
-        std::fs::write(&temp_path, json_bytes)
-            .map_err(|e| format!("Cannot write temporary lifecycle file: {}", e))?;
+        {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&temp_path)
+                .map_err(|e| format!("Cannot create temporary lifecycle file: {}", e))?;
+            file.write_all(&json_bytes)
+                .map_err(|e| format!("Cannot write temporary lifecycle file: {}", e))?;
+            file.sync_all()
+                .map_err(|e| format!("Cannot sync lifecycle file: {}", e))?;
+        }
 
         std::fs::rename(&temp_path, path)
             .map_err(|e| format!("Cannot atomically save lifecycle file: {}", e))?;
@@ -138,9 +145,12 @@ impl TxLifecycleCoordinator {
 
         let raw_hex = match &record.status {
             TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
+            TxLifecycleStatus::Broadcasting { .. } => {
+                record.raw_tx_hex.clone().ok_or_else(|| "Missing raw_tx_hex in record".to_string())?
+            }
             other => {
                 return Err(format!(
-                    "Cannot broadcast transaction in state '{:?}', must be Signed",
+                    "Cannot broadcast transaction in state '{:?}', must be Signed or Broadcasting",
                     other
                 ))
             }
@@ -206,9 +216,12 @@ impl TxLifecycleCoordinator {
 
         let raw_hex = match &record.status {
             TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
+            TxLifecycleStatus::Broadcasting { .. } => {
+                record.raw_tx_hex.clone().ok_or_else(|| "Missing raw_tx_hex in record".to_string())?
+            }
             other => {
                 return Err(format!(
-                    "Cannot broadcast transaction in state '{:?}', must be Signed",
+                    "Cannot broadcast transaction in state '{:?}', must be Signed or Broadcasting",
                     other
                 ))
             }
