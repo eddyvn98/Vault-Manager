@@ -14,6 +14,7 @@ struct LifecycleSnapshot {
 
 #[derive(Clone, Debug)]
 pub struct BtcBroadcastContext {
+    pub lease_token: u64,
     pub raw_hex: String,
     pub expected_txid: String,
     pub expected_wtxid: String,
@@ -23,6 +24,7 @@ pub struct BtcBroadcastContext {
 
 #[derive(Clone, Debug)]
 pub struct BscBroadcastContext {
+    pub lease_token: u64,
     pub raw_hex: String,
     pub expected_sender: String,
     pub expected_recipient: String,
@@ -46,6 +48,8 @@ pub struct TxLifecycleCoordinator {
     records: HashMap<String, TxLifecycleRecord>,
     confirmed_block_hashes: HashMap<String, (u64, String)>, // tx_hash -> (block_height, block_hash)
     pub storage_path: Option<std::path::PathBuf>,
+    pub active_leases: HashMap<String, (u64, u64)>, // draft_id -> (lease_token, started_at_unix)
+    next_lease_token: u64,
 }
 
 #[allow(dead_code)]
@@ -55,6 +59,8 @@ impl Default for TxLifecycleCoordinator {
             records: HashMap::new(),
             confirmed_block_hashes: HashMap::new(),
             storage_path: None,
+            active_leases: HashMap::new(),
+            next_lease_token: 1,
         }
     }
 }
@@ -266,6 +272,16 @@ impl TxLifecycleCoordinator {
             return Err("Mandatory storage path is not configured on TxLifecycleCoordinator".to_string());
         }
 
+        // P0 #2: Exclusive Broadcast Lease check - prevent concurrent broadcasts on the same draft
+        if let Some(&(existing_token, started_at)) = self.active_leases.get(draft_id) {
+            if now_unix < started_at + 60 {
+                return Err(format!(
+                    "Broadcast already in progress for draft '{}' (lease #{}, active for {}s): concurrent broadcast rejected",
+                    draft_id, existing_token, now_unix.saturating_sub(started_at)
+                ));
+            }
+        }
+
         let (raw_hex, expected_txid, expected_wtxid, approved_prevouts, network) = {
             let record = self
                 .records
@@ -274,6 +290,10 @@ impl TxLifecycleCoordinator {
 
             if record.network != BroadcastNetwork::BitcoinSignet {
                 return Err("BTC broadcast requested for non-Bitcoin network".to_string());
+            }
+
+            if matches!(record.status, TxLifecycleStatus::Pending { .. } | TxLifecycleStatus::Confirmed { .. }) {
+                return Err(format!("Draft '{}' is already in state '{:?}', cannot broadcast again", draft_id, record.status));
             }
 
             let expected_txid = record.expected_txid.as_ref().ok_or_else(|| {
@@ -307,6 +327,11 @@ impl TxLifecycleCoordinator {
             (raw, expected_txid, expected_wtxid, approved_prevouts, record.network)
         };
 
+        // Issue unique monotonic lease token
+        let lease_token = self.next_lease_token;
+        self.next_lease_token += 1;
+        self.active_leases.insert(draft_id.to_string(), (lease_token, now_unix));
+
         let broadcasting_status = TxLifecycleStatus::Broadcasting {
             draft_id: draft_id.to_string(),
             attempt,
@@ -315,6 +340,7 @@ impl TxLifecycleCoordinator {
         self.transition_record_and_persist(draft_id, broadcasting_status, now_unix)?;
 
         Ok(BtcBroadcastContext {
+            lease_token,
             raw_hex,
             expected_txid,
             expected_wtxid,
@@ -326,13 +352,38 @@ impl TxLifecycleCoordinator {
     pub fn complete_broadcast_btc(
         &mut self,
         draft_id: &str,
+        lease_token: u64,
         result: Result<String, BtcBroadcastError>,
         attempt: u32,
         max_retries: u32,
         now_unix: u64,
     ) -> Result<BroadcastOutcome, String> {
+        // Enforce lease validity: only the active lease holder can complete the broadcast
+        let is_valid_lease = match self.active_leases.get(draft_id) {
+            Some(&(active_tok, _)) => active_tok == lease_token,
+            None => false,
+        };
+        if !is_valid_lease {
+            return Err(format!("Stale or unauthorized broadcast lease #{} for draft '{}'", lease_token, draft_id));
+        }
+
+        // Check if the record already reached Pending or Confirmed (cannot overwrite with Failed)
+        let current_status = self.records.get(draft_id).map(|r| r.status.clone());
+        if let Some(TxLifecycleStatus::Confirmed { ref tx_hash, .. }) = current_status {
+            self.active_leases.remove(draft_id);
+            return Ok(BroadcastOutcome::Success(tx_hash.clone()));
+        }
+        if let Some(TxLifecycleStatus::Pending { ref tx_hash, .. }) = current_status {
+            if result.is_err() {
+                // A stale or competing error must never overwrite an already Pending transaction!
+                self.active_leases.remove(draft_id);
+                return Ok(BroadcastOutcome::Success(tx_hash.clone()));
+            }
+        }
+
         match result {
             Ok(txid) => {
+                self.active_leases.remove(draft_id);
                 let pending_status = TxLifecycleStatus::Pending {
                     tx_hash: txid.clone(),
                     first_seen_unix: now_unix,
@@ -347,9 +398,12 @@ impl TxLifecycleCoordinator {
                 );
 
                 if is_transient && attempt < max_retries {
+                    // Release current attempt lease so subsequent retry attempt can acquire fresh lease
+                    self.active_leases.remove(draft_id);
                     return Ok(BroadcastOutcome::Retry);
                 }
 
+                self.active_leases.remove(draft_id);
                 let permanent = !is_transient;
                 let failed_status = TxLifecycleStatus::Failed {
                     stage: "broadcast".to_string(),
@@ -373,6 +427,16 @@ impl TxLifecycleCoordinator {
             return Err("Mandatory storage path is not configured on TxLifecycleCoordinator".to_string());
         }
 
+        // P0 #2: Exclusive Broadcast Lease check - prevent concurrent broadcasts on the same draft
+        if let Some(&(existing_token, started_at)) = self.active_leases.get(draft_id) {
+            if now_unix < started_at + 60 {
+                return Err(format!(
+                    "Broadcast already in progress for draft '{}' (lease #{}, active for {}s): concurrent broadcast rejected",
+                    draft_id, existing_token, now_unix.saturating_sub(started_at)
+                ));
+            }
+        }
+
         let (raw_hex, expected_sender, expected_recipient, expected_amount_raw, expected_nonce, expected_gas_limit, expected_gas_price, network) = {
             let record = self
                 .records
@@ -381,6 +445,10 @@ impl TxLifecycleCoordinator {
 
             if record.network != BroadcastNetwork::BscTestnet {
                 return Err("BSC broadcast requested for non-BSC network".to_string());
+            }
+
+            if matches!(record.status, TxLifecycleStatus::Pending { .. } | TxLifecycleStatus::Confirmed { .. }) {
+                return Err(format!("Draft '{}' is already in state '{:?}', cannot broadcast again", draft_id, record.status));
             }
 
             let expected_sender = record.expected_sender.as_ref().ok_or_else(|| {
@@ -429,6 +497,11 @@ impl TxLifecycleCoordinator {
             )
         };
 
+        // Issue unique monotonic lease token
+        let lease_token = self.next_lease_token;
+        self.next_lease_token += 1;
+        self.active_leases.insert(draft_id.to_string(), (lease_token, now_unix));
+
         let broadcasting_status = TxLifecycleStatus::Broadcasting {
             draft_id: draft_id.to_string(),
             attempt,
@@ -437,6 +510,7 @@ impl TxLifecycleCoordinator {
         self.transition_record_and_persist(draft_id, broadcasting_status, now_unix)?;
 
         Ok(BscBroadcastContext {
+            lease_token,
             raw_hex,
             expected_sender,
             expected_recipient,
@@ -451,13 +525,38 @@ impl TxLifecycleCoordinator {
     pub fn complete_broadcast_bsc(
         &mut self,
         draft_id: &str,
+        lease_token: u64,
         result: Result<String, BscBroadcastError>,
         attempt: u32,
         max_retries: u32,
         now_unix: u64,
     ) -> Result<BroadcastOutcome, String> {
+        // Enforce lease validity: only the active lease holder can complete the broadcast
+        let is_valid_lease = match self.active_leases.get(draft_id) {
+            Some(&(active_tok, _)) => active_tok == lease_token,
+            None => false,
+        };
+        if !is_valid_lease {
+            return Err(format!("Stale or unauthorized broadcast lease #{} for draft '{}'", lease_token, draft_id));
+        }
+
+        // Check if the record already reached Pending or Confirmed (cannot overwrite with Failed)
+        let current_status = self.records.get(draft_id).map(|r| r.status.clone());
+        if let Some(TxLifecycleStatus::Confirmed { ref tx_hash, .. }) = current_status {
+            self.active_leases.remove(draft_id);
+            return Ok(BroadcastOutcome::Success(tx_hash.clone()));
+        }
+        if let Some(TxLifecycleStatus::Pending { ref tx_hash, .. }) = current_status {
+            if result.is_err() {
+                // A stale or competing error must never overwrite an already Pending transaction!
+                self.active_leases.remove(draft_id);
+                return Ok(BroadcastOutcome::Success(tx_hash.clone()));
+            }
+        }
+
         match result {
             Ok(tx_hash) => {
+                self.active_leases.remove(draft_id);
                 let pending_status = TxLifecycleStatus::Pending {
                     tx_hash: tx_hash.clone(),
                     first_seen_unix: now_unix,
@@ -472,9 +571,12 @@ impl TxLifecycleCoordinator {
                 );
 
                 if is_transient && attempt < max_retries {
+                    // Release current attempt lease so subsequent retry attempt can acquire fresh lease
+                    self.active_leases.remove(draft_id);
                     return Ok(BroadcastOutcome::Retry);
                 }
 
+                self.active_leases.remove(draft_id);
                 let permanent = !is_transient;
                 let failed_status = TxLifecycleStatus::Failed {
                     stage: "broadcast".to_string(),
@@ -505,7 +607,7 @@ impl TxLifecycleCoordinator {
                 &ctx.approved_prevouts,
                 ctx.network,
             );
-            match self.complete_broadcast_btc(draft_id, broadcast_res, attempt, max_retries, now_unix)? {
+            match self.complete_broadcast_btc(draft_id, ctx.lease_token, broadcast_res, attempt, max_retries, now_unix)? {
                 BroadcastOutcome::Success(txid) => return Ok(txid),
                 BroadcastOutcome::Retry => continue,
                 BroadcastOutcome::Failed(err) => return Err(err),
@@ -534,7 +636,7 @@ impl TxLifecycleCoordinator {
                 &ctx.expected_gas_price,
                 ctx.network,
             );
-            match self.complete_broadcast_bsc(draft_id, broadcast_res, attempt, max_retries, now_unix)? {
+            match self.complete_broadcast_bsc(draft_id, ctx.lease_token, broadcast_res, attempt, max_retries, now_unix)? {
                 BroadcastOutcome::Success(tx_hash) => return Ok(tx_hash),
                 BroadcastOutcome::Retry => continue,
                 BroadcastOutcome::Failed(err) => return Err(err),
