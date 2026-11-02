@@ -283,12 +283,13 @@ pub async fn fetch_btc_balance(address: &str, network: Network) -> Result<BtcBal
 pub async fn fetch_bsc_balance(address: &str, testnet: bool) -> Result<BscBalance, String> {
     let client = Client::builder()
         .timeout(Duration::from_secs(10))
+        .user_agent("VaultManager/0.1.0")
         .build()
         .map_err(|e| e.to_string())?;
 
     let (rpc_url, expected_chain_id, network_name) = if testnet {
         (
-            "https://data-seed-prebsc-1-s1.binance.org:8545",
+            "https://bsc-testnet.publicnode.com",
             97u64,
             "BSC Testnet".to_string(),
         )

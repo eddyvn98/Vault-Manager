@@ -301,12 +301,13 @@ pub struct RpcBscBroadcaster {
 #[allow(dead_code)]
 impl RpcBscBroadcaster {
     pub fn new(broadcast_enabled: bool) -> Self {
-        Self::with_endpoint("https://data-seed-prebsc-1-s1.binance.org:8545", broadcast_enabled)
+        Self::with_endpoint("https://bsc-testnet.publicnode.com", broadcast_enabled)
     }
 
     pub fn with_endpoint(endpoint: &str, broadcast_enabled: bool) -> Self {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
+            .user_agent("VaultManager/0.1.0")
             .build()
             .unwrap_or_else(|_| reqwest::blocking::Client::new());
 

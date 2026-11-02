@@ -92,6 +92,37 @@ export type BscTxPreview = {
 
 export type Action = 'create' | 'restore' | 'unlock';
 
+export type BtcSignedPreview = {
+  draftId: string;
+  txid: string;
+  wtxid: string;
+  feeSatoshis: number;
+  rawTxHex: string;
+};
+
+export type BscSignedPreview = {
+  draftId: string;
+  txHash: string;
+  sender: string;
+  recipient: string;
+  amountRaw: string;
+  nonce: number;
+  gasLimit: number;
+  gasPriceWei: string;
+  rawTxHex: string;
+};
+
+export type TxLifecycleStatus =
+  | { status: 'draftCreated'; details: { draftId: string } }
+  | { status: 'signed'; details: { draftId: string; payloadHash: string; rawTxHex: string } }
+  | { status: 'broadcasting'; details: { draftId: string; attempt: number } }
+  | { status: 'pending'; details: { txHash: string; firstSeenUnix: number } }
+  | { status: 'confirmed'; details: { txHash: string; blockHeight: number; blockHash: string; confirmations: number } }
+  | { status: 'failed'; details: { stage: string; errorMessage: string; permanent: boolean } }
+  | { status: 'dropped'; details: { txHash: string; reason: string } }
+  | { status: 'replaced'; details: { oldTxHash: string; newTxHash: string; reason: string } }
+  | { status: 'reorgDetected'; details: { txHash: string; previousBlockHeight: number; previousBlockHash: string } };
+
 export const offlineStatus: WalletStatus = {
   exists: false,
   unlocked: false,

@@ -1,7 +1,24 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Send, AlertCircle, Copy, Check, FileCode, ShieldAlert, ArrowRight } from 'lucide-react';
-import { BtcTxPreview, BscTxPreview, getErrorMessage } from '../types';
+import {
+  Send,
+  AlertCircle,
+  Copy,
+  Check,
+  CheckCircle2,
+  Loader2,
+  ExternalLink,
+  ShieldCheck,
+  Radio,
+} from 'lucide-react';
+import {
+  BtcTxPreview,
+  BscTxPreview,
+  BtcSignedPreview,
+  BscSignedPreview,
+  TxLifecycleStatus,
+  getErrorMessage,
+} from '../types';
 
 interface TxPrepareModalProps {
   onClose: () => void;
@@ -21,38 +38,79 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
   const [btcPreview, setBtcPreview] = useState<BtcTxPreview | null>(null);
   const [bscPreview, setBscPreview] = useState<BscTxPreview | null>(null);
 
+  // Signed Previews
+  const [btcSigned, setBtcSigned] = useState<BtcSignedPreview | null>(null);
+  const [bscSigned, setBscSigned] = useState<BscSignedPreview | null>(null);
+
+  // Broadcast & Lifecycle
+  const [broadcastTxHash, setBroadcastTxHash] = useState<string | null>(null);
+  const [lifecycle, setLifecycle] = useState<TxLifecycleStatus | null>(null);
+  const [isSigning, setIsSigning] = useState(false);
+  const [isBroadcasting, setIsBroadcasting] = useState(false);
+
+  const activeDraftId = btcPreview?.draftId || bscPreview?.draftId;
+
+  // Poll lifecycle status once broadcasted
+  useEffect(() => {
+    let timer: number | null = null;
+
+    if (broadcastTxHash && activeDraftId) {
+      const poll = async () => {
+        try {
+          const status = await invoke<TxLifecycleStatus>('query_transaction_lifecycle', {
+            draftId: activeDraftId,
+          });
+          setLifecycle(status);
+        } catch (e) {
+          console.error('Lifecycle poll error:', e);
+        }
+      };
+
+      void poll();
+      timer = window.setInterval(poll, 3000);
+    }
+
+    return () => {
+      if (timer) clearInterval(timer);
+    };
+  }, [broadcastTxHash, activeDraftId]);
+
   const handlePrepare = async (e: React.FormEvent) => {
     e.preventDefault();
     setBusy(true);
     setError(null);
     setBtcPreview(null);
     setBscPreview(null);
+    setBtcSigned(null);
+    setBscSigned(null);
+    setBroadcastTxHash(null);
+    setLifecycle(null);
 
     try {
       if (network === 'btc') {
         const cleanAmount = amount.trim();
         if (!/^\d+$/.test(cleanAmount)) {
-          throw new Error('Please enter a valid whole satoshi amount integer (digits only)');
+          throw new Error('Vui lòng nhập số satoshi nguyên hợp lệ (chỉ gồm các chữ số)');
         }
         const satsBig = BigInt(cleanAmount);
         if (satsBig <= 0n) {
-          throw new Error('Satoshi amount must be greater than zero');
+          throw new Error('Số satoshi phải lớn hơn 0');
         }
         if (satsBig > 21_000_000n * 100_000_000n) {
-          throw new Error('Amount exceeds maximum Bitcoin supply (21M BTC)');
+          throw new Error('Số tiền vượt quá tổng cung tối đa của Bitcoin (21M BTC)');
         }
         const satsNum = Number(satsBig);
         if (!Number.isSafeInteger(satsNum)) {
-          throw new Error('Amount exceeds JavaScript safe integer limit');
+          throw new Error('Số tiền vượt quá giới hạn số an toàn của JavaScript');
         }
 
         const cleanRate = feeRate.trim() || '2';
         if (!/^\d+$/.test(cleanRate)) {
-          throw new Error('Fee rate must be a valid whole number (sat/vB)');
+          throw new Error('Mức phí (sat/vB) phải là số nguyên hợp lệ');
         }
         const rateNum = Number(cleanRate);
         if (rateNum <= 0 || rateNum > 1000) {
-          throw new Error('Fee rate must be between 1 and 1000 sat/vB');
+          throw new Error('Mức phí phải nằm trong khoảng từ 1 đến 1000 sat/vB');
         }
 
         const res = await invoke<BtcTxPreview>('prepare_btc_transaction', {
@@ -65,7 +123,7 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
         const cleanRecipient = recipient.trim();
         const cleanAmount = amount.trim();
         if (!cleanAmount) {
-          throw new Error('Please enter a token amount');
+          throw new Error('Vui lòng nhập số lượng USDT muốn chuyển');
         }
         const res = await invoke<BscTxPreview>('prepare_bsc_transaction', {
           recipient: cleanRecipient,
@@ -80,18 +138,62 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
     }
   };
 
+  const handleConfirmAndSign = async () => {
+    setIsSigning(true);
+    setError(null);
+    try {
+      if (network === 'btc' && btcPreview) {
+        const signed = await invoke<BtcSignedPreview>('confirm_and_sign_btc_draft', {
+          draftId: btcPreview.draftId,
+        });
+        setBtcSigned(signed);
+      } else if (network === 'bsc' && bscPreview) {
+        const signed = await invoke<BscSignedPreview>('confirm_and_sign_bsc_draft', {
+          draftId: bscPreview.draftId,
+        });
+        setBscSigned(signed);
+      }
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setIsSigning(false);
+    }
+  };
+
+  const handleBroadcast = async () => {
+    setIsBroadcasting(true);
+    setError(null);
+    try {
+      if (!activeDraftId) throw new Error('Không tìm thấy giao dịch đã ký');
+      const txHash = await invoke<string>('broadcast_signed_transaction', {
+        draftId: activeDraftId,
+      });
+      setBroadcastTxHash(txHash);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setIsBroadcasting(false);
+    }
+  };
+
   const copyPayload = (payload: string) => {
     void navigator.clipboard.writeText(payload);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const explorerUrl =
+    broadcastTxHash &&
+    (network === 'btc'
+      ? `https://mempool.space/signet/tx/${broadcastTxHash}`
+      : `https://testnet.bscscan.com/tx/${broadcastTxHash}`);
+
   return (
     <div className="modal-backdrop">
       <div className="modal-card wide">
         <header className="modal-header">
           <Send size={22} className="text-sky-400" />
-          <h3>Transaction Preparation (P2C-1 Testnet Preview)</h3>
+          <h3>Tạo & Ký Giao Dịch Testnet Thực Tế</h3>
         </header>
 
         <div className="preview-tabs">
@@ -99,10 +201,15 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
             type="button"
             className={`tab-btn ${network === 'btc' ? 'active' : ''}`}
             onClick={() => {
+              if (busy || isSigning || isBroadcasting) return;
               setNetwork('btc');
               setError(null);
               setBtcPreview(null);
               setBscPreview(null);
+              setBtcSigned(null);
+              setBscSigned(null);
+              setBroadcastTxHash(null);
+              setLifecycle(null);
             }}
           >
             Bitcoin Signet
@@ -111,10 +218,15 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
             type="button"
             className={`tab-btn ${network === 'bsc' ? 'active' : ''}`}
             onClick={() => {
+              if (busy || isSigning || isBroadcasting) return;
               setNetwork('bsc');
               setError(null);
               setBtcPreview(null);
               setBscPreview(null);
+              setBtcSigned(null);
+              setBscSigned(null);
+              setBroadcastTxHash(null);
+              setLifecycle(null);
             }}
           >
             BSC Testnet (USDT)
@@ -128,10 +240,11 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
           </div>
         )}
 
-        {!btcPreview && !bscPreview ? (
+        {/* STEP 1: INPUT FORM */}
+        {!btcPreview && !bscPreview && (
           <form onSubmit={handlePrepare} className="grid gap-3">
             <label className="text-xs text-slate-400">
-              Recipient Address ({network === 'btc' ? 'Signet tb1q...' : 'BSC Testnet 0x...'})
+              Địa chỉ nhận ({network === 'btc' ? 'Signet tb1q...' : 'BSC Testnet 0x...'})
               <input
                 type="text"
                 placeholder={network === 'btc' ? 'tb1q...' : '0x...'}
@@ -143,10 +256,10 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
 
             <div className="grid grid-cols-2 gap-3">
               <label className="text-xs text-slate-400">
-                Amount ({network === 'btc' ? 'Satoshis (min 546)' : 'USDT e.g. 1.5'})
+                Số lượng ({network === 'btc' ? 'Satoshis (min 546)' : 'USDT e.g. 0.1'})
                 <input
                   type="text"
-                  placeholder={network === 'btc' ? '10000' : '1.5'}
+                  placeholder={network === 'btc' ? '2000' : '0.1'}
                   value={amount}
                   onChange={(e) => setAmount(e.target.value)}
                   required
@@ -155,7 +268,7 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
 
               {network === 'btc' ? (
                 <label className="text-xs text-slate-400">
-                  Fee Rate (sat/vB)
+                  Phí mạng (sat/vB)
                   <input
                     type="number"
                     min="1"
@@ -165,65 +278,76 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
                 </label>
               ) : (
                 <label className="text-xs text-slate-400">
-                  Network Token
-                  <input type="text" value="Binance-Peg Mock USDT (Chain 97)" disabled />
+                  Mạng & Token
+                  <input type="text" value="Binance-Peg USDT (Chain ID 97)" disabled />
                 </label>
               )}
             </div>
 
             <div className="modal-actions">
               <button type="button" className="subtle" onClick={onClose} disabled={busy}>
-                Cancel
+                Hủy
               </button>
               <button type="submit" disabled={busy}>
-                {busy ? 'Preparing…' : 'Generate Preview'}
+                {busy ? 'Đang chuẩn bị…' : 'Xem trước giao dịch'}
               </button>
             </div>
           </form>
-        ) : (
+        )}
+
+        {/* STEP 2: PREPARED PREVIEW & SIGNING FLOW */}
+        {(btcPreview || bscPreview) && (
           <div className="grid gap-3">
             {/* BTC Preview Display */}
             {btcPreview && (
               <div className="preview-card">
                 <div className="flex justify-between items-center">
-                  <span className="chip status-unlocked">Bản xem trước · Chưa ký</span>
+                  <span className={`chip ${btcSigned ? 'status-badge-confirmed' : 'status-unlocked'}`}>
+                    {btcSigned ? 'Đã ký an toàn' : 'Bản xem trước · Chưa ký'}
+                  </span>
                   <span className="text-[11px] text-slate-400 font-mono">{btcPreview.draftId}</span>
                 </div>
 
                 <div className="preview-row">
-                  <span className="preview-label">Recipient:</span>
+                  <span className="preview-label">Người nhận:</span>
                   <span className="preview-value text-xs">{btcPreview.recipientAddress}</span>
                 </div>
                 <div className="preview-row">
-                  <span className="preview-label">Amount:</span>
-                  <span className="preview-value text-sky-400">{btcPreview.formattedAmountBtc} BTC ({btcPreview.amountSatoshis.toLocaleString()} sats)</span>
+                  <span className="preview-label">Số lượng:</span>
+                  <span className="preview-value text-sky-400">
+                    {btcPreview.formattedAmountBtc} BTC ({btcPreview.amountSatoshis.toLocaleString()} sats)
+                  </span>
                 </div>
                 <div className="preview-row">
-                  <span className="preview-label">Fee ({btcPreview.feeRateSatPerVb} sat/vB):</span>
-                  <span className="preview-value text-amber-400">{btcPreview.formattedFeeBtc} BTC ({btcPreview.feeSatoshis.toLocaleString()} sats)</span>
+                  <span className="preview-label">Phí ({btcPreview.feeRateSatPerVb} sat/vB):</span>
+                  <span className="preview-value text-amber-400">
+                    {btcPreview.formattedFeeBtc} BTC ({btcPreview.feeSatoshis.toLocaleString()} sats)
+                  </span>
                 </div>
                 <div className="preview-row">
-                  <span className="preview-label">Change Address:</span>
+                  <span className="preview-label">Địa chỉ tiền thối:</span>
                   <span className="preview-value text-xs">{btcPreview.changeAddress}</span>
                 </div>
                 <div className="preview-row">
-                  <span className="preview-label">Inputs Selected:</span>
-                  <span className="preview-value">{btcPreview.selectedUtxos.length} UTXO(s)</span>
+                  <span className="preview-label">UTXO đầu vào:</span>
+                  <span className="preview-value">{btcPreview.selectedUtxos.length} UTXO</span>
                 </div>
 
-                <div>
-                  <div className="flex justify-between items-center mb-1 text-[11px] text-slate-400">
-                    <span>Unsigned PSBT Payload:</span>
-                    <button
-                      type="button"
-                      className="mini-action-btn"
-                      onClick={() => copyPayload(btcPreview.unsignedPsbtBase64)}
-                    >
-                      {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />} Copy
-                    </button>
+                {!btcSigned && (
+                  <div>
+                    <div className="flex justify-between items-center mb-1 text-[11px] text-slate-400">
+                      <span>Unsigned PSBT Payload:</span>
+                      <button
+                        type="button"
+                        className="mini-action-btn"
+                        onClick={() => copyPayload(btcPreview.unsignedPsbtBase64)}
+                      >
+                        {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />} Copy
+                      </button>
+                    </div>
+                    <div className="preview-code-box">{btcPreview.unsignedPsbtBase64}</div>
                   </div>
-                  <div className="preview-code-box">{btcPreview.unsignedPsbtBase64}</div>
-                </div>
+                )}
               </div>
             )}
 
@@ -231,59 +355,229 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
             {bscPreview && (
               <div className="preview-card">
                 <div className="flex justify-between items-center">
-                  <span className="chip status-unlocked">Bản xem trước · Chưa ký</span>
+                  <span className={`chip ${bscSigned ? 'status-badge-confirmed' : 'status-unlocked'}`}>
+                    {bscSigned ? 'Đã ký an toàn' : 'Bản xem trước · Chưa ký'}
+                  </span>
                   <span className="text-[11px] text-slate-400 font-mono">{bscPreview.draftId}</span>
                 </div>
 
                 <div className="preview-row">
-                  <span className="preview-label">From:</span>
+                  <span className="preview-label">Người gửi:</span>
                   <span className="preview-value text-xs">{bscPreview.fromAddress}</span>
                 </div>
                 <div className="preview-row">
-                  <span className="preview-label">Recipient:</span>
+                  <span className="preview-label">Người nhận:</span>
                   <span className="preview-value text-xs">{bscPreview.recipientAddress}</span>
                 </div>
                 <div className="preview-row">
                   <span className="preview-label">Token Transfer:</span>
-                  <span className="preview-value text-emerald-400">{bscPreview.formattedAmount} {bscPreview.tokenSymbol}</span>
+                  <span className="preview-value text-emerald-400">
+                    {bscPreview.formattedAmount} {bscPreview.tokenSymbol}
+                  </span>
                 </div>
                 <div className="preview-row">
                   <span className="preview-label">Nonce / Gas Limit:</span>
                   <span className="preview-value">{bscPreview.nonce} / {bscPreview.gasLimit.toLocaleString()}</span>
                 </div>
                 <div className="preview-row">
-                  <span className="preview-label">Estimated Gas Fee:</span>
-                  <span className="preview-value text-amber-400">{bscPreview.estimatedFeeBnb} BNB ({bscPreview.gasPriceGwei} Gwei)</span>
+                  <span className="preview-label">Ước tính phí gas:</span>
+                  <span className="preview-value text-amber-400">
+                    {bscPreview.estimatedFeeBnb} BNB ({bscPreview.gasPriceGwei} Gwei)
+                  </span>
                 </div>
 
-                <div>
-                  <div className="flex justify-between items-center mb-1 text-[11px] text-slate-400">
-                    <span>ERC-20 Calldata (transfer):</span>
-                    <button
-                      type="button"
-                      className="mini-action-btn"
-                      onClick={() => copyPayload(bscPreview.calldataHex)}
-                    >
-                      {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />} Copy
-                    </button>
+                {!bscSigned && (
+                  <div>
+                    <div className="flex justify-between items-center mb-1 text-[11px] text-slate-400">
+                      <span>ERC-20 Calldata (transfer):</span>
+                      <button
+                        type="button"
+                        className="mini-action-btn"
+                        onClick={() => copyPayload(bscPreview.calldataHex)}
+                      >
+                        {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />} Copy
+                      </button>
+                    </div>
+                    <div className="preview-code-box">{bscPreview.calldataHex}</div>
                   </div>
-                  <div className="preview-code-box">{bscPreview.calldataHex}</div>
-                </div>
+                )}
               </div>
             )}
 
+            {/* SIGNED CONFIRMATION DETAILS */}
+            {(btcSigned || bscSigned) && (
+              <div className="preview-card border-emerald-500/30 bg-emerald-950/10">
+                <div className="flex items-center gap-2 text-emerald-400 text-xs font-bold">
+                  <ShieldCheck size={16} />
+                  <span>Giao dịch đã được ký cục bộ thành công!</span>
+                </div>
+
+                {btcSigned && (
+                  <>
+                    <div className="preview-row">
+                      <span className="preview-label">Mã giao dịch (TxID):</span>
+                      <span className="preview-value text-xs text-sky-300">{btcSigned.txid}</span>
+                    </div>
+                    <div className="preview-row">
+                      <span className="preview-label">Witness TxID (WTXID):</span>
+                      <span className="preview-value text-xs text-slate-400">{btcSigned.wtxid}</span>
+                    </div>
+                  </>
+                )}
+
+                {bscSigned && (
+                  <div className="preview-row">
+                    <span className="preview-label">EVM Tx Hash (Keccak-256):</span>
+                    <span className="preview-value text-xs text-emerald-300">{bscSigned.txHash}</span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* BROADCAST & LIFECYCLE TRACKER */}
+            {broadcastTxHash && (
+              <div className="preview-card border-sky-500/30 bg-sky-950/10">
+                <div className="flex justify-between items-center">
+                  <span className="text-xs font-bold text-sky-400 flex items-center gap-2">
+                    <Radio size={14} className="animate-pulse" /> Trạng thái phát sóng On-chain
+                  </span>
+                  {lifecycle && (
+                    <span
+                      className={`status-badge-${
+                        lifecycle.status === 'confirmed'
+                          ? 'confirmed'
+                          : lifecycle.status === 'failed'
+                          ? 'failed'
+                          : 'pending'
+                      }`}
+                    >
+                      {lifecycle.status === 'confirmed' && (
+                        <>
+                          <CheckCircle2 size={12} /> Đã xác nhận on-chain (
+                          {lifecycle.details.confirmations} block)
+                        </>
+                      )}
+                      {lifecycle.status === 'pending' && (
+                        <>
+                          <Loader2 size={12} className="animate-spin" /> Đang chờ thợ đào đóng block
+                        </>
+                      )}
+                      {lifecycle.status === 'broadcasting' && (
+                        <>
+                          <Loader2 size={12} className="animate-spin" /> Đang gửi tới node testnet...
+                        </>
+                      )}
+                      {lifecycle.status === 'failed' && (
+                        <>
+                          <AlertCircle size={12} /> Thất bại: {lifecycle.details.errorMessage}
+                        </>
+                      )}
+                      {lifecycle.status === 'dropped' && (
+                        <>
+                          <AlertCircle size={12} /> Bị loại khỏi mempool: {lifecycle.details.reason}
+                        </>
+                      )}
+                      {lifecycle.status === 'reorgDetected' && (
+                        <>
+                          <AlertCircle size={12} /> Phát hiện Reorg chuỗi!
+                        </>
+                      )}
+                    </span>
+                  )}
+                </div>
+
+                <div className="preview-row">
+                  <span className="preview-label">Hash phát sóng:</span>
+                  <div className="flex items-center gap-2">
+                    <span className="preview-value text-xs text-sky-300 font-mono truncate max-w-[260px]">
+                      {broadcastTxHash}
+                    </span>
+                    <button
+                      type="button"
+                      className="mini-action-btn"
+                      onClick={() => copyPayload(broadcastTxHash)}
+                    >
+                      {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
+                    </button>
+                  </div>
+                </div>
+
+                {explorerUrl && (
+                  <div className="mt-1">
+                    <a
+                      href={explorerUrl}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs text-sky-400 hover:text-sky-300 inline-flex items-center gap-1 font-semibold underline underline-offset-2"
+                    >
+                      Xem trên {network === 'btc' ? 'Mempool Signet Explorer' : 'BscScan Testnet'}
+                      <ExternalLink size={12} />
+                    </a>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* ACTION BUTTONS */}
             <div className="modal-actions">
-              <button
-                type="button"
-                className="disabled-sign-btn"
-                disabled
-                title="P2C-1 Scope: Signing is not enabled until P2C-2 offline test vectors are approved"
-              >
-                Ký giao dịch — Chưa kích hoạt (P2C-1 Preview Only)
-              </button>
-              <button type="button" onClick={onClose}>
-                Close
-              </button>
+              {!btcSigned && !bscSigned ? (
+                <>
+                  <button
+                    type="button"
+                    className="subtle"
+                    onClick={() => {
+                      setBtcPreview(null);
+                      setBscPreview(null);
+                    }}
+                    disabled={isSigning}
+                  >
+                    Quay lại
+                  </button>
+                  <button
+                    type="button"
+                    className="sign-btn"
+                    onClick={handleConfirmAndSign}
+                    disabled={isSigning}
+                  >
+                    {isSigning ? (
+                      <span className="flex items-center gap-2">
+                        <Loader2 size={14} className="animate-spin" /> Đang ký cục bộ…
+                      </span>
+                    ) : (
+                      'Ký giao dịch'
+                    )}
+                  </button>
+                </>
+              ) : !broadcastTxHash ? (
+                <>
+                  <button
+                    type="button"
+                    className="subtle"
+                    onClick={onClose}
+                    disabled={isBroadcasting}
+                  >
+                    Đóng
+                  </button>
+                  <button
+                    type="button"
+                    className="broadcast-btn"
+                    onClick={handleBroadcast}
+                    disabled={isBroadcasting}
+                  >
+                    {isBroadcasting ? (
+                      <span className="flex items-center gap-2">
+                        <Loader2 size={14} className="animate-spin" /> Đang phát sóng…
+                      </span>
+                    ) : (
+                      'Phát sóng giao dịch Testnet'
+                    )}
+                  </button>
+                </>
+              ) : (
+                <button type="button" onClick={onClose}>
+                  Hoàn tất & Đóng
+                </button>
+              )}
             </div>
           </div>
         )}

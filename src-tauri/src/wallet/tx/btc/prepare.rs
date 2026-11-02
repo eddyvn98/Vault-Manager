@@ -18,7 +18,7 @@ pub async fn prepare_signet_tx(
     amount_satoshis: u64,
     fee_rate_opt: Option<u64>,
     db_path: Option<&std::path::Path>,
-) -> Result<BtcTxPreview, String> {
+) -> Result<(BtcTxPreview, crate::wallet::signer::btc::BtcSigningPolicy), String> {
     // 1. Validate inputs and policies
     let recipient_addr = policy::validate_btc_signet_recipient(recipient)?;
     policy::validate_btc_amount(amount_satoshis)?;
@@ -114,6 +114,36 @@ pub async fn prepare_signet_tx(
         (0, "None (absorbed in fee)".into())
     };
 
+    let unspent_list: Vec<_> = wallet.list_unspent().collect();
+    let mut approved_inputs = Vec::new();
+    for (i, input) in psbt.inputs.iter().enumerate() {
+        let prevout = input.witness_utxo.as_ref().ok_or("Input missing witness_utxo")?;
+        let txin = &psbt.unsigned_tx.input[i];
+        let local_out = unspent_list
+            .iter()
+            .find(|u| u.outpoint == txin.previous_output)
+            .ok_or_else(|| format!("Selected UTXO {} not found in wallet unspents", txin.previous_output))?;
+
+        let change = match local_out.keychain {
+            bdk_wallet::KeychainKind::External => 0,
+            bdk_wallet::KeychainKind::Internal => 1,
+        };
+        approved_inputs.push(crate::wallet::signer::btc::ApprovedPrevout {
+            outpoint: txin.previous_output,
+            value_satoshis: prevout.value.to_sat(),
+            script_pubkey: prevout.script_pubkey.clone(),
+            change,
+            derivation_index: local_out.derivation_index,
+        });
+    }
+
+    let policy = crate::wallet::signer::btc::BtcSigningPolicy {
+        expected_recipient: recipient_addr.script_pubkey(),
+        expected_amount_sat: amount_satoshis,
+        expected_change_script: change_output.map(|o| o.script_pubkey.clone()),
+        approved_inputs,
+    };
+
     // 8. Cryptographically secure random draft ID (32 hex characters)
     let mut rand_bytes = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut rand_bytes);
@@ -122,7 +152,7 @@ pub async fn prepare_signet_tx(
     let psbt_bytes = psbt.serialize();
     let psbt_b64 = BASE64.encode(&psbt_bytes);
 
-    Ok(BtcTxPreview {
+    let preview = BtcTxPreview {
         draft_id,
         network: "Bitcoin Signet".into(),
         recipient_address: recipient_addr.to_string(),
@@ -137,7 +167,9 @@ pub async fn prepare_signet_tx(
         unsigned_psbt_base64: psbt_b64,
         signing_enabled: false,
         note: "Bitcoin Signet Unsigned PSBT Preview (P2C-1: Built with BDK 3.2.0)".into(),
-    })
+    };
+
+    Ok((preview, policy))
 }
 
 #[cfg(test)]

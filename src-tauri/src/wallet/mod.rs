@@ -335,6 +335,9 @@ pub struct WalletSession {
     pub session: Mutex<SessionState>,
     pub is_preparing: std::sync::atomic::AtomicBool,
     pub sqlite_tracker: std::sync::Arc<SqliteTracker>,
+    pub coordinator: Mutex<broadcast::lifecycle::TxLifecycleCoordinator>,
+    pub btc_drafts: Mutex<std::collections::HashMap<String, (tx::BtcTxPreview, signer::btc::BtcSigningPolicy)>>,
+    pub bsc_drafts: Mutex<std::collections::HashMap<String, tx::BscCanonicalPayload>>,
 }
 
 impl Default for WalletSession {
@@ -343,8 +346,37 @@ impl Default for WalletSession {
             session: Mutex::new(SessionState::default()),
             is_preparing: std::sync::atomic::AtomicBool::new(false),
             sqlite_tracker: std::sync::Arc::new(SqliteTracker::default()),
+            coordinator: Mutex::new(broadcast::lifecycle::TxLifecycleCoordinator::default()),
+            btc_drafts: Mutex::new(std::collections::HashMap::new()),
+            bsc_drafts: Mutex::new(std::collections::HashMap::new()),
         }
     }
+}
+
+pub fn ensure_coordinator_configured(
+    coordinator: &mut broadcast::lifecycle::TxLifecycleCoordinator,
+    app: &AppHandle,
+) -> Result<(), String> {
+    if coordinator.storage_path.is_none() {
+        let app_dir = app
+            .path()
+            .app_data_dir()
+            .map_err(|e| format!("Cannot resolve app data directory: {}", e))?;
+        let _ = fs::create_dir_all(&app_dir);
+        let path = app_dir.join("tx_lifecycle.json");
+        if path.exists() {
+            match broadcast::lifecycle::TxLifecycleCoordinator::load_from_file(&path) {
+                Ok(loaded) => *coordinator = loaded,
+                Err(e) => {
+                    eprintln!("Warning: could not load existing lifecycle file: {}", e);
+                    coordinator.set_storage_path(path);
+                }
+            }
+        } else {
+            coordinator.set_storage_path(path);
+        }
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -546,6 +578,12 @@ pub fn lock_wallet(state: State<'_, WalletSession>) -> Result<(), String> {
     session.last_activity = None;
     session.active_draft = None;
     session.session_epoch = session.session_epoch.wrapping_add(1);
+    if let Ok(mut btc_drafts) = state.btc_drafts.lock() {
+        btc_drafts.clear();
+    }
+    if let Ok(mut bsc_drafts) = state.bsc_drafts.lock() {
+        bsc_drafts.clear();
+    }
     Ok(())
 }
 
@@ -700,7 +738,7 @@ pub async fn prepare_btc_transaction(
     let db_path = db_dir.join("bdk_signet.sqlite3");
 
     let _conn_guard = state.sqlite_tracker.acquire_connection()?;
-    let preview =
+    let (preview, policy) =
         tx::btc::prepare::prepare_signet_tx(&mnemonic, &recipient, amount_satoshis, fee_rate_sat_vb, Some(&db_path))
             .await?;
 
@@ -715,8 +753,8 @@ pub async fn prepare_btc_transaction(
     }
 
     let payload_hash = compute_btc_payload_hash(&preview.unsigned_psbt_base64);
-
-    let expires_at_unix = LockoutManager::now_unix() + SESSION_TIMEOUT_SECS;
+    let now_unix = LockoutManager::now_unix();
+    let expires_at_unix = now_unix + SESSION_TIMEOUT_SECS;
 
     session.active_draft = Some(ActiveDraft {
         draft_id: preview.draft_id.clone(),
@@ -727,11 +765,25 @@ pub async fn prepare_btc_transaction(
     });
     session.last_activity = Some(Instant::now());
 
+    // Register draft in coordinator
+    {
+        let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+        ensure_coordinator_configured(&mut coord, &app)?;
+        coord.register_draft(&preview.draft_id, broadcast::types::BroadcastNetwork::BitcoinSignet, now_unix)?;
+    }
+
+    // Store draft preview and policy in btc_drafts
+    {
+        let mut btc_drafts = state.btc_drafts.lock().map_err(|_| "Drafts lock error")?;
+        btc_drafts.insert(preview.draft_id.clone(), (preview.clone(), policy));
+    }
+
     Ok(preview)
 }
 
 #[tauri::command]
 pub async fn prepare_bsc_transaction(
+    app: AppHandle,
     state: State<'_, WalletSession>,
     recipient: String,
     amount_tokens: String,
@@ -784,7 +836,8 @@ pub async fn prepare_bsc_transaction(
     };
     let payload_hash = canonical_payload.canonical_hash();
 
-    let expires_at_unix = LockoutManager::now_unix() + SESSION_TIMEOUT_SECS;
+    let now_unix = LockoutManager::now_unix();
+    let expires_at_unix = now_unix + SESSION_TIMEOUT_SECS;
 
     session.active_draft = Some(ActiveDraft {
         draft_id: preview.draft_id.clone(),
@@ -795,7 +848,261 @@ pub async fn prepare_bsc_transaction(
     });
     session.last_activity = Some(Instant::now());
 
+    // Register draft in coordinator
+    {
+        let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+        ensure_coordinator_configured(&mut coord, &app)?;
+        coord.register_draft(&preview.draft_id, broadcast::types::BroadcastNetwork::BscTestnet, now_unix)?;
+    }
+
+    // Store canonical payload in bsc_drafts
+    {
+        let mut bsc_drafts = state.bsc_drafts.lock().map_err(|_| "Drafts lock error")?;
+        bsc_drafts.insert(preview.draft_id.clone(), canonical_payload);
+    }
+
     Ok(preview)
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BtcSignedPreview {
+    pub draft_id: String,
+    pub txid: String,
+    pub wtxid: String,
+    pub fee_satoshis: u64,
+    pub raw_tx_hex: String,
+}
+
+#[tauri::command]
+pub async fn confirm_and_sign_btc_draft(
+    app: AppHandle,
+    state: State<'_, WalletSession>,
+    draft_id: String,
+) -> Result<BtcSignedPreview, String> {
+    let (preview, policy) = {
+        let drafts = state.btc_drafts.lock().map_err(|_| "Drafts state unavailable")?;
+        drafts
+            .get(&draft_id)
+            .cloned()
+            .ok_or_else(|| format!("Draft '{}' not found in session drafts", draft_id))?
+    };
+
+    let signed = {
+        let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+        if !check_and_apply_auto_lock(&mut session) {
+            return Err("Wallet is locked".into());
+        }
+        sign_verified_btc_draft(&mut session, &draft_id, &preview.unsigned_psbt_base64, &policy)?
+    };
+
+    let now_unix = LockoutManager::now_unix();
+
+    let approved_prevouts: Vec<broadcast::types::ApprovedPrevout> = policy
+        .approved_inputs
+        .iter()
+        .map(|inp| broadcast::types::ApprovedPrevout {
+            txid: inp.outpoint.txid.to_string(),
+            vout: inp.outpoint.vout,
+            value_satoshis: inp.value_satoshis,
+            script_pubkey_hex: hex::encode(inp.script_pubkey.as_bytes()),
+        })
+        .collect();
+
+    {
+        let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+        ensure_coordinator_configured(&mut coord, &app)?;
+        coord.record_signed_btc(
+            &draft_id,
+            &signed.payload_hash,
+            &signed.raw_tx_hex,
+            &signed.txid,
+            &signed.wtxid,
+            approved_prevouts,
+            now_unix,
+        )?;
+    }
+
+    Ok(BtcSignedPreview {
+        draft_id,
+        txid: signed.txid,
+        wtxid: signed.wtxid,
+        fee_satoshis: signed.fee_sat,
+        raw_tx_hex: signed.raw_tx_hex,
+    })
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BscSignedPreview {
+    pub draft_id: String,
+    pub tx_hash: String,
+    pub sender: String,
+    pub recipient: String,
+    pub amount_raw: String,
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub gas_price_wei: String,
+    pub raw_tx_hex: String,
+}
+
+#[tauri::command]
+pub async fn confirm_and_sign_bsc_draft(
+    app: AppHandle,
+    state: State<'_, WalletSession>,
+    draft_id: String,
+) -> Result<BscSignedPreview, String> {
+    let canonical = {
+        let drafts = state.bsc_drafts.lock().map_err(|_| "Drafts state unavailable")?;
+        drafts
+            .get(&draft_id)
+            .cloned()
+            .ok_or_else(|| format!("Draft '{}' not found in session drafts", draft_id))?
+    };
+
+    if canonical.chain_id != 97 {
+        return Err(format!(
+            "SECURITY ERROR: BSC chain ID {} is not BSC Testnet (chain ID 97)",
+            canonical.chain_id
+        ));
+    }
+
+    let payload_hash = canonical.canonical_hash();
+    let (signed, sender_addr) = {
+        let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+        if !check_and_apply_auto_lock(&mut session) {
+            return Err("Wallet is locked".into());
+        }
+        let mnemonic_str = session
+            .mnemonic
+            .as_ref()
+            .ok_or_else(|| "Wallet is locked: private key unavailable".to_string())?
+            .clone();
+        let s_addr = bip::derive_bsc_address_at(&mnemonic_str, 0)?;
+        let s = sign_verified_bsc_draft(&mut session, &draft_id, &canonical)?;
+        (s, s_addr)
+    };
+
+    let raw_tx_hex = format!("0x{}", hex::encode(&signed.raw_signed_tx_bytes));
+    let clean = raw_tx_hex.trim().trim_start_matches("0x").trim_start_matches("0X");
+    let raw_bytes = hex::decode(clean).map_err(|e| format!("Invalid EVM hex: {}", e))?;
+    let mut hasher = tiny_keccak::Keccak::v256();
+    let mut hash = [0u8; 32];
+    hasher.update(&raw_bytes);
+    hasher.finalize(&mut hash);
+    let tx_hash = format!("0x{}", hex::encode(hash));
+
+    let now_unix = LockoutManager::now_unix();
+
+    {
+        let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+        ensure_coordinator_configured(&mut coord, &app)?;
+        coord.record_signed_bsc(
+            &draft_id,
+            &payload_hash,
+            &raw_tx_hex,
+            &sender_addr,
+            &canonical.recipient_address,
+            &canonical.amount_raw,
+            canonical.nonce,
+            canonical.gas_limit,
+            &canonical.gas_price_wei,
+            now_unix,
+        )?;
+    }
+
+    Ok(BscSignedPreview {
+        draft_id,
+        tx_hash,
+        sender: sender_addr,
+        recipient: canonical.recipient_address,
+        amount_raw: canonical.amount_raw,
+        nonce: canonical.nonce,
+        gas_limit: canonical.gas_limit,
+        gas_price_wei: canonical.gas_price_wei,
+        raw_tx_hex,
+    })
+}
+
+#[tauri::command]
+pub async fn broadcast_signed_transaction(
+    app: AppHandle,
+    state: State<'_, WalletSession>,
+    draft_id: String,
+) -> Result<String, String> {
+    {
+        let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+        if !check_and_apply_auto_lock(&mut session) {
+            return Err("Wallet is locked".into());
+        }
+        session.last_activity = Some(Instant::now());
+    }
+
+    let (network, draft_id_clone) = {
+        let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+        ensure_coordinator_configured(&mut coord, &app)?;
+        let record = coord
+            .get_record(&draft_id)
+            .ok_or_else(|| format!("Draft '{}' not found in coordinator", draft_id))?;
+        (record.network, draft_id.clone())
+    };
+
+    let now_unix = LockoutManager::now_unix();
+    let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+
+    match network {
+        broadcast::types::BroadcastNetwork::BitcoinSignet => {
+            let broadcaster = broadcast::btc::EsploraBtcBroadcaster::new(true);
+            let txid = coord.execute_broadcast_btc(&draft_id_clone, &broadcaster, 3, now_unix)?;
+            Ok(txid)
+        }
+        broadcast::types::BroadcastNetwork::BscTestnet => {
+            let broadcaster = broadcast::bsc::RpcBscBroadcaster::new(true);
+            let tx_hash = coord.execute_broadcast_bsc(&draft_id_clone, &broadcaster, 3, now_unix)?;
+            Ok(tx_hash)
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn query_transaction_lifecycle(
+    app: AppHandle,
+    state: State<'_, WalletSession>,
+    draft_id: String,
+) -> Result<broadcast::types::TxLifecycleStatus, String> {
+    let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+    ensure_coordinator_configured(&mut coord, &app)?;
+
+    let record = coord
+        .get_record(&draft_id)
+        .ok_or_else(|| format!("Draft '{}' not found in coordinator", draft_id))?;
+
+    let is_onchain = matches!(
+        record.status,
+        broadcast::types::TxLifecycleStatus::Broadcasting { .. }
+            | broadcast::types::TxLifecycleStatus::Pending { .. }
+            | broadcast::types::TxLifecycleStatus::Confirmed { .. }
+            | broadcast::types::TxLifecycleStatus::ReorgDetected { .. }
+            | broadcast::types::TxLifecycleStatus::Failed { permanent: false, .. }
+    );
+
+    if !is_onchain {
+        return Ok(record.status.clone());
+    }
+
+    let network = record.network;
+    let now_unix = LockoutManager::now_unix();
+
+    match network {
+        broadcast::types::BroadcastNetwork::BitcoinSignet => {
+            let broadcaster = broadcast::btc::EsploraBtcBroadcaster::new(true);
+            coord.poll_btc_lifecycle(&draft_id, &broadcaster, now_unix)
+        }
+        broadcast::types::BroadcastNetwork::BscTestnet => {
+            let broadcaster = broadcast::bsc::RpcBscBroadcaster::new(true);
+            coord.poll_bsc_lifecycle(&draft_id, &broadcaster, now_unix)
+        }
+    }
 }
 
 pub fn cleanup_sqlite_files(app_dir: &std::path::Path) -> Result<(), String> {
@@ -900,6 +1207,15 @@ pub fn reset_wallet(
         session.active_draft = None;
         session.session_epoch = session.session_epoch.wrapping_add(1);
     }
+    if let Ok(mut btc_drafts) = state.btc_drafts.lock() {
+        btc_drafts.clear();
+    }
+    if let Ok(mut bsc_drafts) = state.bsc_drafts.lock() {
+        bsc_drafts.clear();
+    }
+    if let Ok(mut coord) = state.coordinator.lock() {
+        *coord = broadcast::lifecycle::TxLifecycleCoordinator::default();
+    }
 
     // 2. Coordinate SQLite shutdown: lock new connections and ensure active connections are closed
     let _reset_permit = state.sqlite_tracker.begin_reset()?;
@@ -911,6 +1227,9 @@ pub fn reset_wallet(
         .map_err(|e| format!("Cannot resolve application data directory for SQLite cleanup: {}", e))?;
 
     cleanup_sqlite_files(&app_dir)?;
+
+    let lifecycle_file = app_dir.join("tx_lifecycle.json");
+    let _ = fs::remove_file(lifecycle_file);
 
     // 4. Only after SQLite cleanup succeeds, remove the vault file
     fs::remove_file(&file).map_err(|e| format!("Cannot remove vault file: {}", e))?;
@@ -1474,5 +1793,261 @@ mod tests {
         assert!(!signed.raw_signed_tx_bytes.is_empty());
         let raw_hex = hex::encode(&signed.raw_signed_tx_bytes);
         assert!(raw_hex.starts_with("f8")); // Standard RLP list prefix
+    }
+
+    #[test]
+    fn test_t68_tauri_command_lifecycle_e2e() {
+        use bitcoin::{
+            amount::Amount, hashes::Hash, locktime::absolute::LockTime, transaction::Version,
+            OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        };
+        use std::str::FromStr;
+        use crate::wallet::broadcast::{
+            types::{BroadcastNetwork, TxLifecycleStatus},
+            btc::MockBtcBroadcaster,
+            bsc::MockBscBroadcaster,
+        };
+
+        let mnemonic = bip::generate_24_words().unwrap();
+        let session_state = WalletSession::default();
+
+        // 1. Initialize session with unlocked mnemonic
+        {
+            let mut s = session_state.session.lock().unwrap();
+            s.mnemonic = Some(mnemonic.clone());
+            s.session_epoch = 1;
+            s.last_activity = Some(Instant::now());
+        }
+
+        let now_unix = LockoutManager::now_unix();
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let key_recv = bip::derive_bip84_privkey_at(&mnemonic, bitcoin::Network::Signet, 0, 0).unwrap();
+        let btc_pub_recv = bitcoin::PublicKey::from_slice(&key_recv.public_key(&secp).serialize()).unwrap();
+        let script_recv = ScriptBuf::new_p2wpkh(&btc_pub_recv.wpubkey_hash().unwrap());
+
+        // --- PART A: BTC SIGNET PIPELINE ---
+        let btc_draft_id = "draft-btc-t68-001";
+        let outpoint = OutPoint::from_str("3333333333333333333333333333333333333333333333333333333333333333:0").unwrap();
+        let recipient_script = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros());
+
+        let unsigned_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: recipient_script.clone(),
+                },
+                TxOut {
+                    value: Amount::from_sat(48_000),
+                    script_pubkey: script_recv.clone(),
+                },
+            ],
+        };
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: script_recv.clone(),
+        });
+
+        use base64::Engine;
+        let btc_psbt_b64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+        let btc_payload_hash = compute_btc_payload_hash(&btc_psbt_b64);
+
+        let btc_policy = signer::btc::BtcSigningPolicy {
+            expected_recipient: recipient_script,
+            expected_amount_sat: 50_000,
+            expected_change_script: Some(script_recv.clone()),
+            approved_inputs: vec![signer::btc::ApprovedPrevout {
+                outpoint,
+                value_satoshis: 100_000,
+                script_pubkey: script_recv.clone(),
+                change: 0,
+                derivation_index: 0,
+            }],
+        };
+
+        // Register in coordinator and store draft
+        {
+            let mut coord = session_state.coordinator.lock().unwrap();
+            coord.register_draft(btc_draft_id, BroadcastNetwork::BitcoinSignet, now_unix).unwrap();
+            let mut drafts = session_state.btc_drafts.lock().unwrap();
+            drafts.insert(btc_draft_id.into(), (
+                tx::BtcTxPreview {
+                    draft_id: btc_draft_id.into(),
+                    network: "Bitcoin Signet".into(),
+                    recipient_address: "tb1q...".into(),
+                    amount_satoshis: 50_000,
+                    formatted_amount_btc: "0.00050000".into(),
+                    fee_satoshis: 2_000,
+                    formatted_fee_btc: "0.00002000".into(),
+                    fee_rate_sat_per_vb: 14,
+                    selected_utxos: vec![],
+                    change_address: "tb1q...".into(),
+                    change_satoshis: 48_000,
+                    unsigned_psbt_base64: btc_psbt_b64.clone(),
+                    signing_enabled: true,
+                    note: "T68 preview".into(),
+                },
+                btc_policy.clone(),
+            ));
+        }
+
+        // Set active draft in session
+        {
+            let mut s = session_state.session.lock().unwrap();
+            s.active_draft = Some(ActiveDraft {
+                draft_id: btc_draft_id.into(),
+                session_epoch: 1,
+                network: "Bitcoin Signet".into(),
+                payload_hash: btc_payload_hash.clone(),
+                expires_at_unix: now_unix + 300,
+            });
+        }
+
+        // Sign BTC draft
+        let signed_btc = {
+            let mut s = session_state.session.lock().unwrap();
+            sign_verified_btc_draft(&mut s, btc_draft_id, &btc_psbt_b64, &btc_policy).unwrap()
+        };
+        assert_eq!(signed_btc.fee_sat, 2_000);
+
+        let approved_prevouts = vec![broadcast::types::ApprovedPrevout {
+            txid: outpoint.txid.to_string(),
+            vout: outpoint.vout,
+            value_satoshis: 100_000,
+            script_pubkey_hex: hex::encode(script_recv.as_bytes()),
+        }];
+
+        // Record signed in coordinator
+        {
+            let temp_storage = std::env::temp_dir().join(format!("t68_coord_{}.json", now_unix));
+            let mut coord = session_state.coordinator.lock().unwrap();
+            coord.set_storage_path(temp_storage.clone());
+            coord.record_signed_btc(
+                btc_draft_id,
+                &signed_btc.payload_hash,
+                &signed_btc.raw_tx_hex,
+                &signed_btc.txid,
+                &signed_btc.wtxid,
+                approved_prevouts.clone(),
+                now_unix,
+            ).unwrap();
+
+            // Verify status is Signed
+            let rec = coord.get_record(btc_draft_id).unwrap();
+            assert!(matches!(rec.status, TxLifecycleStatus::Signed { .. }));
+
+            // Broadcast via Mock
+            let mock_btc = MockBtcBroadcaster::default();
+            mock_btc.set_next_broadcast_result(Ok(signed_btc.txid.clone()));
+            let txid = coord.execute_broadcast_btc(btc_draft_id, &mock_btc, 3, now_unix).unwrap();
+            assert_eq!(txid, signed_btc.txid);
+
+            // Poll lifecycle via Mock -> Confirmed
+            mock_btc.set_tx_status(&txid, crate::wallet::broadcast::btc::BtcTxQueryStatus::Confirmed {
+                block_height: 100,
+                block_hash: "0000000000000000000000000000000000000000000000000000000000000001".into(),
+                confirmations: 1,
+            });
+            let status = coord.poll_btc_lifecycle(btc_draft_id, &mock_btc, now_unix).unwrap();
+            assert!(matches!(status, TxLifecycleStatus::Confirmed { confirmations: 1, .. }));
+
+            let _ = fs::remove_file(temp_storage);
+        }
+
+        // --- PART B: BSC TESTNET PIPELINE ---
+        let bsc_draft_id = "draft-bsc-t68-001";
+        let sender_bsc = bip::derive_bsc_address(&mnemonic).unwrap();
+        let bsc_canonical = tx::BscCanonicalPayload {
+            chain_id: 97,
+            token_contract: Some("0x337610d27c682E347C9cD60BD4b3b107C9d34dDd".into()),
+            recipient_address: "0x1111111111111111111111111111111111111111".into(),
+            amount_raw: "1000000000000000000".into(), // 1.0 USDT (18 decimals)
+            nonce: 10,
+            gas_limit: 70_000,
+            gas_price_wei: "3000000000".into(), // 3 Gwei
+            calldata_hex: "0xa9059cbb00000000000000000000000011111111111111111111111111111111111111110000000000000000000000000000000000000000000000000de0b6b3a7640000".into(),
+        };
+        let bsc_payload_hash = bsc_canonical.canonical_hash();
+
+        // Register draft and set active draft in session
+        {
+            let mut coord = session_state.coordinator.lock().unwrap();
+            coord.register_draft(bsc_draft_id, BroadcastNetwork::BscTestnet, now_unix).unwrap();
+            let mut drafts = session_state.bsc_drafts.lock().unwrap();
+            drafts.insert(bsc_draft_id.into(), bsc_canonical.clone());
+
+            let mut s = session_state.session.lock().unwrap();
+            s.active_draft = Some(ActiveDraft {
+                draft_id: bsc_draft_id.into(),
+                session_epoch: 1,
+                network: "BSC Testnet".into(),
+                payload_hash: bsc_payload_hash.clone(),
+                expires_at_unix: now_unix + 300,
+            });
+        }
+
+        // Sign BSC draft
+        let signed_bsc = {
+            let mut s = session_state.session.lock().unwrap();
+            sign_verified_bsc_draft(&mut s, bsc_draft_id, &bsc_canonical).unwrap()
+        };
+        let raw_bsc_hex = format!("0x{}", hex::encode(&signed_bsc.raw_signed_tx_bytes));
+
+        // Record signed in coordinator
+        {
+            let temp_storage = std::env::temp_dir().join(format!("t68_coord_bsc_{}.json", now_unix));
+            let mut coord = session_state.coordinator.lock().unwrap();
+            coord.set_storage_path(temp_storage.clone());
+            coord.record_signed_bsc(
+                bsc_draft_id,
+                &bsc_payload_hash,
+                &raw_bsc_hex,
+                &sender_bsc,
+                &bsc_canonical.recipient_address,
+                &bsc_canonical.amount_raw,
+                bsc_canonical.nonce,
+                bsc_canonical.gas_limit,
+                &bsc_canonical.gas_price_wei,
+                now_unix,
+            ).unwrap();
+
+            // Verify status is Signed
+            let rec = coord.get_record(bsc_draft_id).unwrap();
+            assert!(matches!(rec.status, TxLifecycleStatus::Signed { .. }));
+
+            let clean = raw_bsc_hex.trim().trim_start_matches("0x").trim_start_matches("0X");
+            let raw_bytes = hex::decode(clean).unwrap();
+            let mut hasher = tiny_keccak::Keccak::v256();
+            let mut hash = [0u8; 32];
+            use tiny_keccak::Hasher;
+            hasher.update(&raw_bytes);
+            hasher.finalize(&mut hash);
+            let expected_tx_hash = format!("0x{}", hex::encode(hash));
+
+            // Broadcast via Mock
+            let mock_bsc = MockBscBroadcaster::default();
+            mock_bsc.set_next_broadcast_result(Ok(expected_tx_hash.clone()));
+            let tx_hash = coord.execute_broadcast_bsc(bsc_draft_id, &mock_bsc, 3, now_unix).unwrap();
+            assert_eq!(tx_hash, expected_tx_hash);
+
+            // Poll lifecycle via Mock -> Confirmed
+            mock_bsc.set_receipt(&tx_hash, crate::wallet::broadcast::bsc::BscReceiptStatus::Success {
+                block_number: 200,
+                block_hash: "0x1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef".into(),
+                gas_used: 50_000,
+            });
+            let status = coord.poll_bsc_lifecycle(bsc_draft_id, &mock_bsc, now_unix).unwrap();
+            assert!(matches!(status, TxLifecycleStatus::Confirmed { confirmations: 1, .. }));
+
+            let _ = fs::remove_file(temp_storage);
+        }
     }
 }

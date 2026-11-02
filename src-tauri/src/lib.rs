@@ -17,7 +17,11 @@ pub fn run() {
             wallet::query_btc_balance,
             wallet::query_bsc_balance,
             wallet::prepare_btc_transaction,
-            wallet::prepare_bsc_transaction
+            wallet::prepare_bsc_transaction,
+            wallet::confirm_and_sign_btc_draft,
+            wallet::confirm_and_sign_bsc_draft,
+            wallet::broadcast_signed_transaction,
+            wallet::query_transaction_lifecycle
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Vault Manager local wallet");
