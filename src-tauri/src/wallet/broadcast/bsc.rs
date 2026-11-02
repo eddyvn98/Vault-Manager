@@ -54,6 +54,7 @@ impl std::error::Error for BscBroadcastError {}
 #[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BscReceiptStatus {
+    NotFound,
     Pending,
     Success {
         block_number: u64,
@@ -207,7 +208,7 @@ impl BscBroadcaster for MockBscBroadcaster {
         }
 
         let map = self.receipt_map.lock().unwrap();
-        Ok(map.get(tx_hash).cloned().unwrap_or(BscReceiptStatus::Pending))
+        Ok(map.get(tx_hash).cloned().unwrap_or(BscReceiptStatus::NotFound))
     }
 }
 
@@ -623,11 +624,8 @@ impl RpcBscBroadcaster {
             return Ok(BscReceiptStatus::Pending);
         }
 
-        // 3. Not found in receipt AND not found in mempool -> Unknown!
-        Err(BscBroadcastError::Timeout(format!(
-            "Transaction '{}' was not found in mempool or block receipts. Status unknown.",
-            tx_hash
-        )))
+        // 3. Not found in receipt AND not found in mempool -> NotFound!
+        Ok(BscReceiptStatus::NotFound)
     }
 
     fn call_rpc(&self, method: &str, params: serde_json::Value) -> Result<String, BscBroadcastError> {
@@ -754,52 +752,6 @@ impl BscBroadcaster for RpcBscBroadcaster {
             ));
         }
 
-        let formatted_hash = if tx_hash.starts_with("0x") {
-            tx_hash.to_string()
-        } else {
-            format!("0x{}", tx_hash)
-        };
-
-        let result_str = self.call_rpc("eth_getTransactionReceipt", serde_json::json!([formatted_hash]))?;
-        if result_str == "null" || result_str.trim().is_empty() {
-            return Ok(BscReceiptStatus::Pending);
-        }
-
-        let receipt: serde_json::Value = serde_json::from_str(&result_str)
-            .map_err(|e| BscBroadcastError::RpcError { code: -32700, message: format!("Cannot parse receipt JSON: {}", e) })?;
-
-        let status_hex = receipt.get("status").and_then(|v| v.as_str())
-            .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'status' field".to_string() })?;
-        let block_number_hex = receipt.get("blockNumber").and_then(|v| v.as_str())
-            .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'blockNumber' field".to_string() })?;
-        let block_number = u64::from_str_radix(block_number_hex.trim_start_matches("0x").trim_start_matches("0X"), 16)
-            .map_err(|e| BscBroadcastError::RpcError { code: -32603, message: format!("Invalid blockNumber hex: {}", e) })?;
-        let block_hash = receipt.get("blockHash").and_then(|v| v.as_str())
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'blockHash' field".to_string() })?
-            .to_string();
-        let gas_used_hex = receipt.get("gasUsed").and_then(|v| v.as_str())
-            .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'gasUsed' field".to_string() })?;
-        let gas_used = u64::from_str_radix(gas_used_hex.trim_start_matches("0x").trim_start_matches("0X"), 16)
-            .map_err(|e| BscBroadcastError::RpcError { code: -32603, message: format!("Invalid gasUsed hex: {}", e) })?;
-
-        if status_hex == "0x1" || status_hex == "0x01" {
-            Ok(BscReceiptStatus::Success {
-                block_number,
-                block_hash,
-                gas_used,
-            })
-        } else if status_hex == "0x0" || status_hex == "0x00" {
-            Ok(BscReceiptStatus::Reverted {
-                block_number,
-                block_hash,
-                reason: "EVM execution reverted (status 0x0)".to_string(),
-            })
-        } else {
-            Err(BscBroadcastError::RpcError {
-                code: -32603,
-                message: format!("Unrecognized receipt status '{}'", status_hex),
-            })
-        }
+        self.query_mempool_or_receipt(tx_hash)
     }
 }

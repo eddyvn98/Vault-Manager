@@ -9,6 +9,7 @@ import {
   Loader2,
   ExternalLink,
   ShieldCheck,
+  ShieldAlert,
   Radio,
 } from 'lucide-react';
 import {
@@ -50,9 +51,30 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
   const [isSigning, setIsSigning] = useState(false);
   const [isPreflighting, setIsPreflighting] = useState(false);
   const [isBroadcasting, setIsBroadcasting] = useState(false);
+  const [recoveredDraft, setRecoveredDraft] = useState<any | null>(null);
 
-  const activeDraftId = btcPreview?.draftId || bscPreview?.draftId;
+  const activeDraftId = btcPreview?.draftId || bscPreview?.draftId || recoveredDraft?.draft_id;
   const isPollingRef = useRef(false);
+
+  // Check on mount for recovered transactions after app restart
+  useEffect(() => {
+    invoke<any[]>('list_lifecycle_records')
+      .then((records) => {
+        if (Array.isArray(records) && records.length > 0) {
+          const ongoing = records.find(r => 
+            r.status && (
+              r.status.Broadcasting !== undefined ||
+              r.status.Pending !== undefined ||
+              (r.status.Failed && !r.status.Failed.permanent)
+            )
+          );
+          if (ongoing) {
+            setRecoveredDraft(ongoing);
+          }
+        }
+      })
+      .catch((err) => console.error('Failed to query lifecycle records:', err));
+  }, []);
 
   // Poll lifecycle status once broadcasted (with overlap guard)
   useEffect(() => {
@@ -263,6 +285,43 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
           <div className="error text-xs flex items-center gap-2" role="alert">
             <AlertCircle size={14} className="shrink-0" />
             <span>{error}</span>
+          </div>
+        )}
+
+        {/* RECOVERY CARD AFTER RESTART */}
+        {recoveredDraft && !broadcastTxHash && (
+          <div className="preview-card border-amber-500/40 bg-amber-950/20 mb-3">
+            <div className="flex items-center justify-between gap-3">
+              <div>
+                <div className="text-amber-400 text-xs font-bold flex items-center gap-1.5">
+                  <ShieldAlert size={14} />
+                  <span>Phát hiện giao dịch chưa hoàn tất sau khi khởi động lại</span>
+                </div>
+                <div className="text-[11px] text-slate-300 font-mono mt-1">
+                  Draft: {recoveredDraft.draft_id} ({recoveredDraft.network}) · Trạng thái: {typeof recoveredDraft.status === 'object' ? Object.keys(recoveredDraft.status)[0] : recoveredDraft.status}
+                </div>
+              </div>
+              <button
+                type="button"
+                className="wallet-button-secondary text-xs px-3 py-1.5 shrink-0"
+                onClick={async () => {
+                  try {
+                    setBusy(true);
+                    const st = await invoke<TxLifecycleStatus>('query_transaction_lifecycle', {
+                      draftId: recoveredDraft.draft_id,
+                    });
+                    setLifecycle(st);
+                    setBroadcastTxHash(recoveredDraft.tx_hash || recoveredDraft.expected_txid || 'reconciled');
+                  } catch (e) {
+                    setError(getErrorMessage(e));
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                Hòa giải & Tiếp tục theo dõi
+              </button>
+            </div>
           </div>
         )}
 

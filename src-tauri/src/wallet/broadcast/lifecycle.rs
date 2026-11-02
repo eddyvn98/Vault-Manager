@@ -725,13 +725,23 @@ impl TxLifecycleCoordinator {
                         record.status.clone()
                     }
                 } else if matches!(record.status, TxLifecycleStatus::Broadcasting { .. }) {
-                    let failed = TxLifecycleStatus::Failed {
-                        stage: "broadcast".to_string(),
-                        error_message: "Broadcast unconfirmed on-chain: transaction not found in mempool or blocks".to_string(),
-                        permanent: false,
+                    let is_active_in_flight = match self.active_leases.get(draft_id) {
+                        Some(&(_, started_at)) => now_unix < started_at + 60,
+                        None => false,
                     };
-                    record.transition_to(failed.clone(), now_unix)?;
-                    failed
+                    if is_active_in_flight {
+                        // In-flight broadcast has not timed out yet (<60s). Keep Broadcasting status,
+                        // do not mark Failed and do not overwrite or abort the active broadcast!
+                        record.status.clone()
+                    } else {
+                        let failed = TxLifecycleStatus::Failed {
+                            stage: "broadcast".to_string(),
+                            error_message: "Broadcast unconfirmed on-chain: transaction not found in mempool or blocks".to_string(),
+                            permanent: false,
+                        };
+                        record.transition_to(failed.clone(), now_unix)?;
+                        failed
+                    }
                 } else {
                     record.status.clone()
                 }
@@ -790,7 +800,13 @@ impl TxLifecycleCoordinator {
             }
         };
 
-        self.active_leases.remove(draft_id);
+        let is_active_in_flight = match self.active_leases.get(draft_id) {
+            Some(&(_, started_at)) => now_unix < started_at + 60,
+            None => false,
+        };
+        if !(is_active_in_flight && matches!(record.status, TxLifecycleStatus::Broadcasting { .. })) {
+            self.active_leases.remove(draft_id);
+        }
         self.persist_if_configured()?;
         Ok(res)
     }
@@ -830,6 +846,37 @@ impl TxLifecycleCoordinator {
             .map_err(|e| format!("Query BSC receipt error: {}", e))?;
 
         let res = match receipt {
+            BscReceiptStatus::NotFound => {
+                if let TxLifecycleStatus::Confirmed { block_height, block_hash, .. } = &record.status {
+                    let reorg = TxLifecycleStatus::ReorgDetected {
+                        tx_hash: tx_hash.clone(),
+                        previous_block_height: *block_height,
+                        previous_block_hash: block_hash.clone(),
+                    };
+                    record.transition_to(reorg.clone(), now_unix)?;
+                    reorg
+                } else if matches!(record.status, TxLifecycleStatus::Broadcasting { .. }) {
+                    let is_active_in_flight = match self.active_leases.get(draft_id) {
+                        Some(&(_, started_at)) => now_unix < started_at + 60,
+                        None => false,
+                    };
+                    if is_active_in_flight {
+                        // In-flight broadcast has not timed out yet (<60s). Keep Broadcasting status,
+                        // do not mark Failed and do not overwrite or abort the active broadcast!
+                        record.status.clone()
+                    } else {
+                        let failed = TxLifecycleStatus::Failed {
+                            stage: "broadcast".to_string(),
+                            error_message: "Broadcast unconfirmed on-chain: transaction not found in mempool or blocks".to_string(),
+                            permanent: false,
+                        };
+                        record.transition_to(failed.clone(), now_unix)?;
+                        failed
+                    }
+                } else {
+                    record.status.clone()
+                }
+            }
             BscReceiptStatus::Pending => {
                 // If the transaction was previously Confirmed and now receipt returned Pending or disappeared,
                 // this indicates a chain reorganization fork has dropped or invalidated the receipt!
@@ -897,7 +944,13 @@ impl TxLifecycleCoordinator {
             }
         };
 
-        self.active_leases.remove(draft_id);
+        let is_active_in_flight = match self.active_leases.get(draft_id) {
+            Some(&(_, started_at)) => now_unix < started_at + 60,
+            None => false,
+        };
+        if !(is_active_in_flight && matches!(record.status, TxLifecycleStatus::Broadcasting { .. })) {
+            self.active_leases.remove(draft_id);
+        }
         self.persist_if_configured()?;
         Ok(res)
     }

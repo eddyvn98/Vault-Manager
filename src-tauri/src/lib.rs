@@ -22,7 +22,8 @@ pub fn run() {
             wallet::confirm_and_sign_bsc_draft,
             wallet::preflight_signed_transaction,
             wallet::broadcast_signed_transaction,
-            wallet::query_transaction_lifecycle
+            wallet::query_transaction_lifecycle,
+            wallet::list_lifecycle_records
         ])
         .run(tauri::generate_context!())
         .expect("failed to start Vault Manager local wallet");

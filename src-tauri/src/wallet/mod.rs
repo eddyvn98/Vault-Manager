@@ -1369,6 +1369,18 @@ pub async fn query_transaction_lifecycle(
     .map_err(|e| format!("Background polling task panicked: {}", e))?
 }
 
+#[tauri::command]
+pub async fn list_lifecycle_records(
+    app: AppHandle,
+    state: State<'_, WalletSession>,
+) -> Result<Vec<broadcast::types::TxLifecycleRecord>, String> {
+    let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+    ensure_coordinator_configured(&mut coord, &app)?;
+    let mut records = coord.export_records();
+    records.sort_by_key(|r| std::cmp::Reverse(r.updated_at_unix));
+    Ok(records)
+}
+
 pub fn cleanup_sqlite_files(app_dir: &std::path::Path) -> Result<(), String> {
     // 1. Clean up any leftover staged directories from previous interrupted resets
     if let Ok(entries) = fs::read_dir(app_dir) {
@@ -3039,6 +3051,109 @@ mod tests {
         let reloaded_coord = broadcast::lifecycle::TxLifecycleCoordinator::load_from_file(&temp_storage).unwrap();
         let reloaded_rec = reloaded_coord.get_record(draft_id).unwrap();
         assert!(matches!(reloaded_rec.status, TxLifecycleStatus::Pending { .. }));
+
+        let _ = fs::remove_file(temp_storage);
+    }
+
+    #[test]
+    fn test_t77_in_flight_poll_not_found_preserves_exclusive_lease_and_bsc_mempool_lookup() {
+        use crate::wallet::broadcast::{
+            btc::{BtcTxQueryStatus, MockBtcBroadcaster},
+            bsc::{BscReceiptStatus, MockBscBroadcaster},
+            types::{BroadcastNetwork, TxLifecycleStatus},
+        };
+
+        let temp_storage = std::env::temp_dir().join(format!("t77_coord_{}.json", LockoutManager::now_unix()));
+        let mut coord = broadcast::lifecycle::TxLifecycleCoordinator::default();
+        coord.set_storage_path(temp_storage.clone());
+        let now_unix = LockoutManager::now_unix();
+
+        // 1. BTC IN-FLIGHT POLL NOT FOUND PRESERVES LEASE:
+        let draft_btc = "draft-btc-t77-inflight";
+        coord.register_draft(draft_btc, BroadcastNetwork::BitcoinSignet, now_unix).unwrap();
+        coord.record_signed_btc(
+            draft_btc,
+            "0x7777",
+            "0200000001...",
+            "txid_t77_btc",
+            "wtxid_t77_btc",
+            vec![broadcast::types::ApprovedPrevout {
+                txid: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                vout: 0,
+                value_satoshis: 15_000,
+                script_pubkey_hex: "0014...".into(),
+            }],
+            now_unix,
+        ).unwrap();
+
+        // Begin broadcast -> acquires exclusive lease #1, status Broadcasting
+        let ctx = coord.begin_broadcast_btc(draft_btc, 1, now_unix).unwrap();
+        assert_eq!(ctx.lease_token, 1);
+        assert!(coord.active_leases.contains_key(draft_btc));
+
+        // In-flight polling occurs after 5 seconds while HTTP POST is still traveling across network.
+        // Node responds with NotFound (hasn't arrived in mempool yet)
+        let mock_btc = MockBtcBroadcaster::new();
+        mock_btc.set_tx_status("txid_t77_btc", BtcTxQueryStatus::NotFound);
+
+        let status_after_poll = coord.poll_btc_lifecycle(draft_btc, &mock_btc, now_unix + 5).unwrap();
+        // In-flight status must REMAIN Broadcasting, NOT Failed!
+        assert!(matches!(status_after_poll, TxLifecycleStatus::Broadcasting { .. }));
+        // Lease #1 MUST NOT BE DELETED!
+        assert_eq!(coord.active_leases.get(draft_btc), Some(&(1, now_unix)));
+
+        // Concurrent attempt to begin broadcast during this window MUST STILL BE REJECTED!
+        let concurrent_req = coord.begin_broadcast_btc(draft_btc, 1, now_unix + 6);
+        assert!(concurrent_req.is_err());
+        assert!(concurrent_req.unwrap_err().contains("concurrent broadcast rejected"));
+
+        // When the original in-flight request finishes and completes with lease #1:
+        let complete_res = coord.complete_broadcast_btc(
+            draft_btc,
+            ctx.lease_token,
+            Ok("txid_t77_btc".into()),
+            1,
+            1,
+            now_unix + 10,
+        ).unwrap();
+        assert_eq!(complete_res, broadcast::lifecycle::BroadcastOutcome::Success("txid_t77_btc".into()));
+        let rec_btc = coord.get_record(draft_btc).unwrap();
+        assert!(matches!(rec_btc.status, TxLifecycleStatus::Pending { .. }));
+
+        // 2. BSC MEMPOOL LOOKUP DISTINGUISHES PENDING FROM UNKNOWN / NOT FOUND:
+        let draft_bsc = "draft-bsc-t77-mempool";
+        coord.register_draft(draft_bsc, BroadcastNetwork::BscTestnet, now_unix).unwrap();
+        coord.record_signed_bsc(
+            draft_bsc,
+            "0x8888",
+            "0xf86c018504a817c8008252089411111111111111111111111111111111111111118080",
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "500",
+            0,
+            65_000,
+            "3000000000",
+            now_unix,
+        ).unwrap();
+
+        let _ctx_bsc = coord.begin_broadcast_bsc(draft_bsc, 1, now_unix).unwrap();
+        let mock_bsc = MockBscBroadcaster::new();
+
+        // CASE A: Node has neither receipt nor mempool record -> NotFound while in flight (<60s)
+        let bsc_tx_hash = coord.get_record(draft_bsc).unwrap().tx_hash.clone().unwrap();
+        // Default mock returns NotFound
+        let bsc_status_nf = coord.poll_bsc_lifecycle(draft_bsc, &mock_bsc, now_unix + 5).unwrap();
+        // In-flight status must REMAIN Broadcasting, NOT Failed!
+        assert!(matches!(bsc_status_nf, TxLifecycleStatus::Broadcasting { .. }));
+        assert!(coord.active_leases.contains_key(draft_bsc));
+
+        // CASE B: Mempool lookup finds transaction pending in mempool (via eth_getTransactionByHash)
+        mock_bsc.set_receipt(&bsc_tx_hash, BscReceiptStatus::Pending);
+        let bsc_status_pending = coord.poll_bsc_lifecycle(draft_bsc, &mock_bsc, now_unix + 10).unwrap();
+        assert!(matches!(bsc_status_pending, TxLifecycleStatus::Pending { .. }));
+
+        // Active lease is now safely reconciled and cleared
+        assert!(!coord.active_leases.contains_key(draft_bsc));
 
         let _ = fs::remove_file(temp_storage);
     }
