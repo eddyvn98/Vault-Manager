@@ -58,6 +58,47 @@ pub fn derive_btc_address(mnemonic: &str, network: Network) -> Result<String, St
     derive_btc_address_at(mnemonic, network, 0, 0)
 }
 
+/// Derive Native SegWit (P2WPKH) Bitcoin private key (BIP84) at specific change and index branch.
+pub fn derive_bip84_privkey_at(
+    mnemonic: &str,
+    network: Network,
+    change: u32,
+    index: u32,
+) -> Result<bitcoin::secp256k1::SecretKey, String> {
+    let m = Mnemonic::parse_in(Language::English, mnemonic.trim())
+        .map_err(|_| "Invalid mnemonic phrase")?;
+    let seed = m.to_seed("");
+    let secp = Secp256k1::new();
+
+    let master = Xpriv::new_master(network, &seed).map_err(|e| e.to_string())?;
+    let coin_type = match network {
+        Network::Bitcoin => 0,
+        _ => 1,
+    };
+    let path_str = format!("m/84'/{}'/0'/{}/{}", coin_type, change, index);
+    let path = DerivationPath::from_str(&path_str).map_err(|e| e.to_string())?;
+    let child = master.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
+    Ok(child.to_priv().inner)
+}
+
+/// Derive BNB Smart Chain (BSC) EVM private key at specific address index.
+/// Path: m/44'/60'/0'/0/{index}
+pub fn derive_bsc_privkey_at(
+    mnemonic: &str,
+    index: u32,
+) -> Result<secp256k1::SecretKey, String> {
+    let m = Mnemonic::parse_in(Language::English, mnemonic.trim())
+        .map_err(|_| "Invalid mnemonic phrase")?;
+    let seed = m.to_seed("");
+    let secp = Secp256k1::new();
+
+    let master = Xpriv::new_master(Network::Bitcoin, &seed).map_err(|e| e.to_string())?;
+    let path_str = format!("m/44'/60'/0'/0/{}", index);
+    let path = DerivationPath::from_str(&path_str).map_err(|e| e.to_string())?;
+    let child = master.derive_priv(&secp, &path).map_err(|e| e.to_string())?;
+    Ok(child.to_priv().inner)
+}
+
 /// Derive BNB Smart Chain (BSC) EVM address at specific address index.
 /// Path: m/44'/60'/0'/0/{index}
 /// Formatted with standard EIP-55 mixed-case checksum.

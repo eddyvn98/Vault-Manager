@@ -12,6 +12,8 @@ use crate::wallet::tx::policy;
 pub struct ApprovedPrevout {
     pub outpoint: OutPoint,
     pub value_satoshis: u64,
+    pub script_pubkey: ScriptBuf,
+    pub derivation_index: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -24,7 +26,7 @@ pub struct BtcSigningPolicy {
 
 /// Independently validate PSBT inputs, outputs, amounts, recipient, change, and fees against approved draft policy.
 /// Guarantees:
-/// 1. Every input matches an approved OutPoint (txid:vout) and EXACT satoshi value (prevents even 1-sat fee spoofing).
+/// 1. Every input matches an approved OutPoint (txid:vout), EXACT satoshi value, and EXACT script_pubkey.
 /// 2. Total input = sum of approved inputs.
 /// 3. Recipient output matches exact approved script and exact amount.
 /// 4. Any change output matches approved change script. No unrecognized outputs allowed.
@@ -69,6 +71,13 @@ pub fn validate_psbt_before_signing(
             return Err(format!(
                 "Input {} value mismatch: expected {} sats, found {} sats (tampering detected)",
                 i, approved.value_satoshis, input_val
+            ));
+        }
+
+        if utxo.script_pubkey != approved.script_pubkey {
+            return Err(format!(
+                "Input {} script_pubkey mismatch: expected {}, found {} (tampering detected)",
+                i, approved.script_pubkey, utxo.script_pubkey
             ));
         }
 
@@ -211,6 +220,34 @@ pub fn finalize_p2wpkh_psbt_input(
     Ok(())
 }
 
+/// Secure pre-sign verified workflow for multi-input PSBTs where each input may be
+/// derived from a different BIP-84 index (HD derivation).
+pub fn sign_and_finalize_verified_psbt_multi(
+    psbt: &mut Psbt,
+    policy: &BtcSigningPolicy,
+    secp: &Secp256k1<secp256k1::All>,
+    privkeys: &[SecretKey],
+) -> Result<u64, String> {
+    if privkeys.len() != psbt.inputs.len() {
+        return Err(format!(
+            "Key count mismatch: {} keys provided for {} PSBT inputs",
+            privkeys.len(),
+            psbt.inputs.len()
+        ));
+    }
+
+    // 1. Mandatory pre-signing validation
+    let fee = validate_psbt_before_signing(psbt, policy)?;
+
+    // 2. Sign and finalize every input per BIP-174 using its own derived key
+    for (i, key) in privkeys.iter().enumerate() {
+        sign_p2wpkh_psbt_input(psbt, i, secp, key)?;
+        finalize_p2wpkh_psbt_input(psbt, i)?;
+    }
+
+    Ok(fee)
+}
+
 /// Secure pre-sign verified workflow: Validates PSBT against policy FIRST,
 /// and only proceeds to signing and finalizing all inputs if validation passes.
 pub fn sign_and_finalize_verified_psbt(
@@ -219,16 +256,8 @@ pub fn sign_and_finalize_verified_psbt(
     secp: &Secp256k1<secp256k1::All>,
     privkey: &SecretKey,
 ) -> Result<u64, String> {
-    // 1. Mandatory pre-signing validation
-    let fee = validate_psbt_before_signing(psbt, policy)?;
-
-    // 2. Sign and finalize every input per BIP-174
-    for i in 0..psbt.inputs.len() {
-        sign_p2wpkh_psbt_input(psbt, i, secp, privkey)?;
-        finalize_p2wpkh_psbt_input(psbt, i)?;
-    }
-
-    Ok(fee)
+    let keys = vec![*privkey; psbt.inputs.len()];
+    sign_and_finalize_verified_psbt_multi(psbt, policy, secp, &keys)
 }
 
 /// Cryptographically verifies that a P2WPKH input in a PSBT has a valid BIP-143 signature.
@@ -347,7 +376,7 @@ mod tests {
         let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
         psbt.inputs[0].witness_utxo = Some(TxOut {
             value: prevout_value,
-            script_pubkey: wallet_script,
+            script_pubkey: wallet_script.clone(),
         });
 
         let policy = BtcSigningPolicy {
@@ -357,6 +386,8 @@ mod tests {
             approved_inputs: vec![ApprovedPrevout {
                 outpoint: prevout_point,
                 value_satoshis: 50_000,
+                script_pubkey: wallet_script,
+                derivation_index: 0,
             }],
         };
 
@@ -458,5 +489,105 @@ mod tests {
             verify_p2wpkh_psbt_input(&tampered_post_sign, 0, &secp).is_err(),
             "Signature must fail if transaction was altered after signing"
         );
+    }
+
+    #[test]
+    fn it03_multi_input_distinct_bip84_derivation_signing_and_script_tamper() {
+        let secp = Secp256k1::new();
+
+        // 1. Derive two distinct BIP84 private keys (e.g. index 0 and index 1)
+        let privkey0 = SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001").unwrap();
+        let privkey1 = SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000002").unwrap();
+
+        let pub0 = privkey0.public_key(&secp);
+        let btc_pub0 = bitcoin::PublicKey::from_slice(&pub0.serialize()).unwrap();
+        let script0 = ScriptBuf::new_p2wpkh(&btc_pub0.wpubkey_hash().unwrap());
+
+        let pub1 = privkey1.public_key(&secp);
+        let btc_pub1 = bitcoin::PublicKey::from_slice(&pub1.serialize()).unwrap();
+        let script1 = ScriptBuf::new_p2wpkh(&btc_pub1.wpubkey_hash().unwrap());
+
+        assert_ne!(script0, script1, "Scripts must be distinct");
+
+        let outpoint0 = OutPoint::from_str("1111111111111111111111111111111111111111111111111111111111111111:0").unwrap();
+        let outpoint1 = OutPoint::from_str("2222222222222222222222222222222222222222222222222222222222222222:1").unwrap();
+
+        let tx_in0 = TxIn {
+            previous_output: outpoint0,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        };
+        let tx_in1 = TxIn {
+            previous_output: outpoint1,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        };
+
+        let recipient_script = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros());
+        let tx_out = TxOut {
+            value: Amount::from_sat(75_000),
+            script_pubkey: recipient_script.clone(),
+        };
+
+        let unsigned_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![tx_in0, tx_in1],
+            output: vec![tx_out],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
+        // Input 0: 50,000 sats
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: script0.clone(),
+        });
+        // Input 1: 30,000 sats (Total in: 80,000, Total out: 75,000 -> Fee: 5,000)
+        psbt.inputs[1].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(30_000),
+            script_pubkey: script1.clone(),
+        });
+
+        let policy = BtcSigningPolicy {
+            expected_recipient: recipient_script,
+            expected_amount_sat: 75_000,
+            expected_change_script: None,
+            approved_inputs: vec![
+                ApprovedPrevout {
+                    outpoint: outpoint0,
+                    value_satoshis: 50_000,
+                    script_pubkey: script0.clone(),
+                    derivation_index: 0,
+                },
+                ApprovedPrevout {
+                    outpoint: outpoint1,
+                    value_satoshis: 30_000,
+                    script_pubkey: script1.clone(),
+                    derivation_index: 1,
+                },
+            ],
+        };
+
+        // 2. Multi-key signing success
+        let mut psbt_valid = psbt.clone();
+        let fee = sign_and_finalize_verified_psbt_multi(
+            &mut psbt_valid,
+            &policy,
+            &secp,
+            &[privkey0, privkey1],
+        ).expect("Multi-key signing must succeed");
+        assert_eq!(fee, 5000);
+
+        // Verify both inputs cryptographically
+        verify_p2wpkh_psbt_input(&psbt_valid, 0, &secp).expect("Input 0 signature must verify");
+        verify_p2wpkh_psbt_input(&psbt_valid, 1, &secp).expect("Input 1 signature must verify");
+
+        // 3. TAMPER TEST: Tampering with script_pubkey on Input 1
+        let mut psbt_tampered_script = psbt.clone();
+        psbt_tampered_script.inputs[1].witness_utxo.as_mut().unwrap().script_pubkey = script0.clone(); // fake script
+        let err = validate_psbt_before_signing(&psbt_tampered_script, &policy).unwrap_err();
+        assert!(err.contains("Input 1 script_pubkey mismatch"), "Error was: {}", err);
     }
 }

@@ -220,32 +220,70 @@ impl Eip155SignedTransaction {
     }
 }
 
-/// Validate transaction against approved policy, contract, calldata, and authorized sender address before signing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BscSigningPolicy {
+    pub expected_chain_id: u64,
+    pub expected_to: String,
+    pub expected_data: Vec<u8>,
+    pub expected_sender: String,
+    pub expected_value: BigUint, // Strictly zero for BEP-20 token transfers
+    pub expected_nonce: u64,
+    pub expected_gas_limit: u64,
+    pub expected_gas_price: BigUint,
+}
+
+/// Validate transaction against approved policy, contract, calldata, gas fields, nonce, value,
+/// and authorized sender address before signing.
 pub fn validate_and_sign_bsc_tx(
     tx: &Eip155Transaction,
-    expected_chain_id: u64,
-    expected_to: &str,
-    expected_data: &[u8],
-    expected_sender: &str,
+    policy: &BscSigningPolicy,
     secp: &Secp256k1<secp256k1::All>,
     secret_key: &SecretKey,
 ) -> Result<Eip155SignedTransaction, String> {
-    if tx.chain_id != expected_chain_id {
+    if tx.chain_id != policy.expected_chain_id {
         return Err(format!(
             "Chain ID mismatch: expected {}, got {}",
-            expected_chain_id, tx.chain_id
+            policy.expected_chain_id, tx.chain_id
         ));
     }
 
-    if tx.to.to_lowercase() != expected_to.to_lowercase() {
+    if tx.to.to_lowercase() != policy.expected_to.to_lowercase() {
         return Err(format!(
             "Recipient contract mismatch: expected {}, got {}",
-            expected_to, tx.to
+            policy.expected_to, tx.to
         ));
     }
 
-    if tx.data != expected_data {
+    if tx.data != policy.expected_data {
         return Err("Transaction calldata does not match approved payload".into());
+    }
+
+    if tx.value != policy.expected_value {
+        return Err(format!(
+            "Transaction value mismatch: expected {} wei, got {} wei (unintended BNB transfer forbidden)",
+            policy.expected_value, tx.value
+        ));
+    }
+
+    if tx.nonce != policy.expected_nonce {
+        return Err(format!(
+            "Nonce mismatch: expected {}, got {}",
+            policy.expected_nonce, tx.nonce
+        ));
+    }
+
+    if tx.gas_limit != policy.expected_gas_limit {
+        return Err(format!(
+            "Gas limit mismatch: expected {}, got {}",
+            policy.expected_gas_limit, tx.gas_limit
+        ));
+    }
+
+    if tx.gas_price != policy.expected_gas_price {
+        return Err(format!(
+            "Gas price mismatch: expected {} wei, got {} wei",
+            policy.expected_gas_price, tx.gas_price
+        ));
     }
 
     // Verify gas policy
@@ -258,10 +296,10 @@ pub fn validate_and_sign_bsc_tx(
     let signed = tx.sign(secp, secret_key)?;
     let recovered = signed.recover_sender(secp)?;
 
-    if recovered.to_lowercase() != expected_sender.to_lowercase() {
+    if recovered.to_lowercase() != policy.expected_sender.to_lowercase() {
         return Err(format!(
             "Recovered sender ({}) does not match authorized owner address ({})",
-            recovered, expected_sender
+            recovered, policy.expected_sender
         ));
     }
 
@@ -300,49 +338,69 @@ mod tests {
             chain_id: 97,
         };
 
+        let policy = BscSigningPolicy {
+            expected_chain_id: 97,
+            expected_to: contract_to.into(),
+            expected_data: valid_data.clone(),
+            expected_sender: expected_owner.clone(),
+            expected_value: BigUint::from(0u32),
+            expected_nonce: 0,
+            expected_gas_limit: 65_000,
+            expected_gas_price: BigUint::from(3_000_000_000u64),
+        };
+
         // 1. Valid transaction signing & sender match -> PASS
-        let sign_res = validate_and_sign_bsc_tx(
-            &tx, 97, contract_to, &valid_data, &expected_owner, &secp, &test_privkey
-        );
+        let sign_res = validate_and_sign_bsc_tx(&tx, &policy, &secp, &test_privkey);
         assert!(sign_res.is_ok(), "Valid BSC transaction must pass validation and signing");
 
         // 2. Chain ID mismatch (e.g. prepared for 56 instead of 97) -> REJECT
         let mut tx_wrong_chain = tx.clone();
         tx_wrong_chain.chain_id = 56;
-        let err_chain = validate_and_sign_bsc_tx(
-            &tx_wrong_chain, 97, contract_to, &valid_data, &expected_owner, &secp, &test_privkey
-        );
+        let err_chain = validate_and_sign_bsc_tx(&tx_wrong_chain, &policy, &secp, &test_privkey);
         assert!(err_chain.is_err(), "Chain ID mismatch must be rejected");
 
         // 3. Contract address tampered -> REJECT
         let mut tx_wrong_contract = tx.clone();
         tx_wrong_contract.to = "0x1111111111111111111111111111111111111111".into();
-        let err_contract = validate_and_sign_bsc_tx(
-            &tx_wrong_contract, 97, contract_to, &valid_data, &expected_owner, &secp, &test_privkey
-        );
+        let err_contract = validate_and_sign_bsc_tx(&tx_wrong_contract, &policy, &secp, &test_privkey);
         assert!(err_contract.is_err(), "Contract address tampering must be rejected");
 
         // 4. Calldata tampered (amount or recipient modified) -> REJECT
         let mut tx_wrong_data = tx.clone();
         tx_wrong_data.data[10] ^= 0x01;
-        let err_data = validate_and_sign_bsc_tx(
-            &tx_wrong_data, 97, contract_to, &valid_data, &expected_owner, &secp, &test_privkey
-        );
+        let err_data = validate_and_sign_bsc_tx(&tx_wrong_data, &policy, &secp, &test_privkey);
         assert!(err_data.is_err(), "Calldata tampering must be rejected");
 
-        // 5. Total fee exceeding 0.05 BNB cap -> REJECT
+        // 5. Unintended BNB transfer in token transaction (tx.value > 0) -> REJECT
+        let mut tx_with_bnb = tx.clone();
+        tx_with_bnb.value = BigUint::from(1u32); // 1 Wei BNB
+        let err_value = validate_and_sign_bsc_tx(&tx_with_bnb, &policy, &secp, &test_privkey);
+        assert!(err_value.is_err(), "Unintended BNB transfer must be rejected");
+        assert!(err_value.unwrap_err().contains("unintended BNB transfer forbidden"));
+
+        // 6. Nonce tampered -> REJECT
+        let mut tx_wrong_nonce = tx.clone();
+        tx_wrong_nonce.nonce = 1;
+        let err_nonce = validate_and_sign_bsc_tx(&tx_wrong_nonce, &policy, &secp, &test_privkey);
+        assert!(err_nonce.is_err(), "Nonce tampering must be rejected");
+
+        // 7. Gas price tampered (even within 0.05 BNB cap) -> REJECT
+        let mut tx_tampered_gas_price = tx.clone();
+        tx_tampered_gas_price.gas_price = BigUint::from(4_000_000_000u64); // 4 Gwei instead of approved 3 Gwei
+        let err_gas_price = validate_and_sign_bsc_tx(&tx_tampered_gas_price, &policy, &secp, &test_privkey);
+        assert!(err_gas_price.is_err(), "Gas price deviation from approved draft must be rejected");
+
+        // 8. Total fee exceeding 0.05 BNB cap -> REJECT
         let mut tx_expensive = tx.clone();
         tx_expensive.gas_price = BigUint::from(1_000_000_000_000u64); // 1000 Gwei (fee = 0.065 BNB)
-        let err_fee = validate_and_sign_bsc_tx(
-            &tx_expensive, 97, contract_to, &valid_data, &expected_owner, &secp, &test_privkey
-        );
+        let mut expensive_policy = policy.clone();
+        expensive_policy.expected_gas_price = tx_expensive.gas_price.clone();
+        let err_fee = validate_and_sign_bsc_tx(&tx_expensive, &expensive_policy, &secp, &test_privkey);
         assert!(err_fee.is_err(), "Fee exceeding 0.05 BNB cap must be rejected");
 
-        // 6. Signing with unauthorized key (sender mismatch) -> REJECT
+        // 9. Signing with unauthorized key (sender mismatch) -> REJECT
         let wrong_privkey = SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000002").unwrap();
-        let err_key = validate_and_sign_bsc_tx(
-            &tx, 97, contract_to, &valid_data, &expected_owner, &secp, &wrong_privkey
-        );
+        let err_key = validate_and_sign_bsc_tx(&tx, &policy, &secp, &wrong_privkey);
         assert!(err_key.is_err(), "Signing with non-authorized key must be rejected");
     }
 

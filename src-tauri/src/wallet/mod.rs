@@ -47,6 +47,10 @@ impl SessionState {
         draft_id: &str,
         expected_payload_hash: &str,
     ) -> Result<ActiveDraft, String> {
+        if self.mnemonic.is_none() {
+            return Err("Wallet is locked: unlocking required before consuming draft".into());
+        }
+
         let draft = self
             .active_draft
             .as_ref()
@@ -74,6 +78,102 @@ impl SessionState {
         let consumed = self.active_draft.take().unwrap();
         Ok(consumed)
     }
+}
+
+pub fn compute_btc_payload_hash(unsigned_psbt_base64: &str) -> String {
+    let mut hasher = Keccak::v256();
+    let mut hash = [0u8; 32];
+    hasher.update(unsigned_psbt_base64.as_bytes());
+    hasher.finalize(&mut hash);
+    format!("0x{}", hex::encode(hash))
+}
+
+pub fn compute_bsc_payload_hash(
+    chain_id: u64,
+    token_contract: Option<&str>,
+    recipient_address: &str,
+    amount_raw: &str,
+    nonce: u64,
+    gas_limit: u64,
+    gas_price_wei: &str,
+) -> String {
+    let canonical = format!(
+        "bsc:{}:{}:{}:{}:{}:{}:{}",
+        chain_id,
+        token_contract.unwrap_or(""),
+        recipient_address,
+        amount_raw,
+        nonce,
+        gas_limit,
+        gas_price_wei
+    );
+    let mut hasher = Keccak::v256();
+    let mut hash = [0u8; 32];
+    hasher.update(canonical.as_bytes());
+    hasher.finalize(&mut hash);
+    format!("0x{}", hex::encode(hash))
+}
+
+/// Binds draft verification directly to BTC signing: Impossible to sign without
+/// verifying and consuming an active draft in the current session epoch with an unlocked wallet.
+#[allow(dead_code)]
+pub fn sign_verified_btc_draft(
+    session: &mut SessionState,
+    draft_id: &str,
+    unsigned_psbt_base64: &str,
+    psbt: &mut bitcoin::Psbt,
+    policy: &signer::btc::BtcSigningPolicy,
+    derivation_indices: &[u32],
+) -> Result<u64, String> {
+    let payload_hash = compute_btc_payload_hash(unsigned_psbt_base64);
+    session.verify_and_consume_draft(draft_id, &payload_hash)?;
+
+    let mnemonic_str = session
+        .mnemonic
+        .as_ref()
+        .ok_or_else(|| "Wallet is locked: private key unavailable".to_string())?;
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let mut privkeys = Vec::with_capacity(derivation_indices.len());
+    for &idx in derivation_indices {
+        let key = bip::derive_bip84_privkey_at(mnemonic_str, bitcoin::Network::Signet, 0, idx)?;
+        privkeys.push(key);
+    }
+
+    let fee = signer::btc::sign_and_finalize_verified_psbt_multi(psbt, policy, &secp, &privkeys)?;
+    Ok(fee)
+}
+
+/// Binds draft verification directly to BSC signing: Impossible to sign without
+/// verifying and consuming an active draft in the current session epoch with an unlocked wallet.
+#[allow(dead_code)]
+pub fn sign_verified_bsc_draft(
+    session: &mut SessionState,
+    draft_id: &str,
+    tx: &signer::bsc::Eip155Transaction,
+    policy: &signer::bsc::BscSigningPolicy,
+) -> Result<signer::bsc::Eip155SignedTransaction, String> {
+    let payload_hash = compute_bsc_payload_hash(
+        policy.expected_chain_id,
+        Some(&policy.expected_to),
+        &policy.expected_to,
+        &hex::encode(&policy.expected_data),
+        policy.expected_nonce,
+        policy.expected_gas_limit,
+        &policy.expected_gas_price.to_string(),
+    );
+    session.verify_and_consume_draft(draft_id, &payload_hash)?;
+
+    let mnemonic_str = session
+        .mnemonic
+        .as_ref()
+        .ok_or_else(|| "Wallet is locked: private key unavailable".to_string())?;
+
+    let secp = secp256k1::Secp256k1::new();
+    let privkey = bip::derive_bsc_privkey_at(mnemonic_str, 0)?;
+
+    let signed = signer::bsc::validate_and_sign_bsc_tx(tx, policy, &secp, &privkey)?;
+    Ok(signed)
 }
 
 pub struct WalletSession {
@@ -522,7 +622,24 @@ pub async fn prepare_bsc_transaction(
     Ok(preview)
 }
 
+pub fn cleanup_sqlite_files(app_dir: &std::path::Path) -> Result<(), String> {
+    let bdk_wal = app_dir.join("bdk_signet.sqlite3-wal");
+    if bdk_wal.exists() {
+        fs::remove_file(&bdk_wal).map_err(|e| format!("Cannot remove SQLite WAL journal: {}", e))?;
+    }
+    let bdk_shm = app_dir.join("bdk_signet.sqlite3-shm");
+    if bdk_shm.exists() {
+        fs::remove_file(&bdk_shm).map_err(|e| format!("Cannot remove SQLite SHM index: {}", e))?;
+    }
+    let bdk_db = app_dir.join("bdk_signet.sqlite3");
+    if bdk_db.exists() {
+        fs::remove_file(&bdk_db).map_err(|e| format!("Cannot remove BDK SQLite database: {}", e))?;
+    }
+    Ok(())
+}
+
 /// Secure reset: Requires valid password verification to authenticate the owner before deleting.
+/// Clean up SQLite storage FIRST before touching encrypted vault file, ensuring atomic reset.
 #[tauri::command]
 pub fn reset_wallet(
     app: AppHandle,
@@ -543,29 +660,25 @@ pub fn reset_wallet(
         return Err(format!("Authentication failed: {}", e));
     }
 
-    fs::remove_file(&file).map_err(|e| format!("Cannot remove vault file: {}", e))?;
-    if let Ok(app_dir) = app.path().app_data_dir() {
-        let bdk_db = app_dir.join("bdk_signet.sqlite3");
-        if bdk_db.exists() {
-            fs::remove_file(&bdk_db).map_err(|e| format!("Cannot remove BDK database: {}", e))?;
-        }
-        let bdk_shm = app_dir.join("bdk_signet.sqlite3-shm");
-        if bdk_shm.exists() {
-            let _ = fs::remove_file(bdk_shm);
-        }
-        let bdk_wal = app_dir.join("bdk_signet.sqlite3-wal");
-        if bdk_wal.exists() {
-            let _ = fs::remove_file(bdk_wal);
-        }
+    // 1. Immediately invalidate and wipe in-memory session and drafts
+    {
+        let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+        session.mnemonic = None;
+        session.last_activity = None;
+        session.pending_creation = None;
+        session.active_draft = None;
+        session.session_epoch = session.session_epoch.wrapping_add(1);
     }
+
+    // 2. Clean up SQLite database and journals FIRST
+    if let Ok(app_dir) = app.path().app_data_dir() {
+        cleanup_sqlite_files(&app_dir)?;
+    }
+
+    // 3. Only after SQLite cleanup succeeds, remove the vault file
+    fs::remove_file(&file).map_err(|e| format!("Cannot remove vault file: {}", e))?;
     mgr.record_success();
 
-    let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
-    session.mnemonic = None;
-    session.last_activity = None;
-    session.pending_creation = None;
-    session.active_draft = None;
-    session.session_epoch = session.session_epoch.wrapping_add(1);
     Ok(())
 }
 
@@ -668,7 +781,7 @@ mod tests {
         session.session_epoch = 1;
         let now = LockoutManager::now_unix();
 
-        // 1. Setup active draft
+        // 1. If wallet is locked (no mnemonic), consume fails immediately
         let draft = ActiveDraft {
             draft_id: "draft-123".into(),
             session_epoch: 1,
@@ -676,6 +789,13 @@ mod tests {
             payload_hash: "0xabcdef123456".into(),
             expires_at_unix: now + 300,
         };
+        session.active_draft = Some(draft.clone());
+        let err_locked = session.verify_and_consume_draft("draft-123", "0xabcdef123456");
+        assert!(err_locked.is_err());
+        assert!(err_locked.unwrap_err().contains("Wallet is locked"));
+
+        // Unlock wallet
+        session.mnemonic = Some(Zeroizing::new("test-mnemonic".to_string()));
         session.active_draft = Some(draft);
 
         // 2. Draft ID mismatch -> error, active_draft preserved
@@ -795,5 +915,33 @@ mod tests {
         let mut s = session_state.lock().unwrap();
         let consumed = s.verify_and_consume_draft("draft-task2", "0xhash2");
         assert!(consumed.is_ok(), "Task 2 draft must be intact and consumable in epoch 1");
+    }
+
+    #[test]
+    fn test_cleanup_sqlite_files_and_atomic_reset_ordering() {
+        let temp_dir = std::env::temp_dir().join(format!("cleanup_sqlite_test_{}", LockoutManager::now_unix()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let db_file = temp_dir.join("bdk_signet.sqlite3");
+        let wal_file = temp_dir.join("bdk_signet.sqlite3-wal");
+        let shm_file = temp_dir.join("bdk_signet.sqlite3-shm");
+
+        fs::write(&db_file, b"sqlite database mock content").unwrap();
+        fs::write(&wal_file, b"sqlite wal journal").unwrap();
+        fs::write(&shm_file, b"sqlite shm index").unwrap();
+
+        assert!(db_file.exists());
+        assert!(wal_file.exists());
+        assert!(shm_file.exists());
+
+        // Perform safe cleanup
+        cleanup_sqlite_files(&temp_dir).expect("Cleanup must succeed");
+
+        assert!(!db_file.exists(), "DB file must be removed");
+        assert!(!wal_file.exists(), "WAL file must be removed");
+        assert!(!shm_file.exists(), "SHM file must be removed");
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
