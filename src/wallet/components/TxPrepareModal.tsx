@@ -242,7 +242,7 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
     setTimeout(() => setCopied(false), 2000);
   };
 
-  const trackingNetwork = recoveredDraft
+  const trackingNetwork = (activeTrackingId && recoveredDraft && activeTrackingId === recoveredDraft.recordId)
     ? (recoveredDraft.network === 'bitcoin_signet' ? 'btc' : 'bsc')
     : network;
 
@@ -310,7 +310,11 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
 
       {broadcastTxHash ? (
         <div className="preview-row">
-          <span className="preview-label">Hash phát sóng:</span>
+          <span className="preview-label">
+            {lifecycle && (lifecycle.status === 'pending' || lifecycle.status === 'confirmed')
+              ? 'Hash phát sóng:'
+              : 'TxID dự kiến — chưa xác nhận on-chain:'}
+          </span>
           <div className="flex items-center gap-2">
             <span className="preview-value text-xs text-sky-300 font-mono truncate max-w-[260px]">
               {broadcastTxHash}
