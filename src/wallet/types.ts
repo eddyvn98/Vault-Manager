@@ -112,6 +112,16 @@ export type BscSignedPreview = {
   rawTxHex: string;
 };
 
+export type PreflightReport = {
+  draftId: string;
+  network: string;
+  status: string;
+  isValid: boolean;
+  rawTxHex: string;
+  txidOrHash: string;
+  checks: string[];
+};
+
 export type TxLifecycleStatus =
   | { status: 'draftCreated'; details: { draftId: string } }
   | { status: 'signed'; details: { draftId: string; payloadHash: string; rawTxHex: string } }

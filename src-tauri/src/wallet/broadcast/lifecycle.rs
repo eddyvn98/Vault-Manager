@@ -12,6 +12,34 @@ struct LifecycleSnapshot {
     confirmed_block_hashes: HashMap<String, (u64, String)>,
 }
 
+#[derive(Clone, Debug)]
+pub struct BtcBroadcastContext {
+    pub raw_hex: String,
+    pub expected_txid: String,
+    pub expected_wtxid: String,
+    pub approved_prevouts: Vec<crate::wallet::broadcast::types::ApprovedPrevout>,
+    pub network: BroadcastNetwork,
+}
+
+#[derive(Clone, Debug)]
+pub struct BscBroadcastContext {
+    pub raw_hex: String,
+    pub expected_sender: String,
+    pub expected_recipient: String,
+    pub expected_amount_raw: String,
+    pub expected_nonce: u64,
+    pub expected_gas_limit: u64,
+    pub expected_gas_price: String,
+    pub network: BroadcastNetwork,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BroadcastOutcome {
+    Success(String),
+    Retry,
+    Failed(String),
+}
+
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct TxLifecycleCoordinator {
@@ -227,13 +255,12 @@ impl TxLifecycleCoordinator {
         self.transition_record_and_persist(draft_id, signed_status, now_unix)
     }
 
-    pub fn execute_broadcast_btc(
+    pub fn begin_broadcast_btc(
         &mut self,
         draft_id: &str,
-        broadcaster: &dyn BtcBroadcaster,
-        max_retries: u32,
+        attempt: u32,
         now_unix: u64,
-    ) -> Result<String, String> {
+    ) -> Result<BtcBroadcastContext, String> {
         // Mandatory persistence configuration
         if self.storage_path.is_none() {
             return Err("Mandatory storage path is not configured on TxLifecycleCoordinator".to_string());
@@ -280,64 +307,67 @@ impl TxLifecycleCoordinator {
             (raw, expected_txid, expected_wtxid, approved_prevouts, record.network)
         };
 
-        let mut attempt = 0u32;
-        loop {
-            attempt += 1;
-            let broadcasting_status = TxLifecycleStatus::Broadcasting {
-                draft_id: draft_id.to_string(),
-                attempt,
-            };
-            // AUTO-PERSIST BEFORE NETWORK I/O (P1 Hardening)
-            self.transition_record_and_persist(draft_id, broadcasting_status, now_unix)?;
+        let broadcasting_status = TxLifecycleStatus::Broadcasting {
+            draft_id: draft_id.to_string(),
+            attempt,
+        };
+        // AUTO-PERSIST BEFORE NETWORK I/O (P1 Hardening)
+        self.transition_record_and_persist(draft_id, broadcasting_status, now_unix)?;
 
-            let broadcast_res = broadcaster.broadcast_verified(
-                &raw_hex,
-                &expected_txid,
-                &expected_wtxid,
-                &approved_prevouts,
-                network,
-            );
+        Ok(BtcBroadcastContext {
+            raw_hex,
+            expected_txid,
+            expected_wtxid,
+            approved_prevouts,
+            network,
+        })
+    }
 
-            match broadcast_res {
-                Ok(txid) => {
-                    let pending_status = TxLifecycleStatus::Pending {
-                        tx_hash: txid.clone(),
-                        first_seen_unix: now_unix,
-                    };
-                    self.transition_record_and_persist(draft_id, pending_status, now_unix)?;
-                    return Ok(txid);
+    pub fn complete_broadcast_btc(
+        &mut self,
+        draft_id: &str,
+        result: Result<String, BtcBroadcastError>,
+        attempt: u32,
+        max_retries: u32,
+        now_unix: u64,
+    ) -> Result<BroadcastOutcome, String> {
+        match result {
+            Ok(txid) => {
+                let pending_status = TxLifecycleStatus::Pending {
+                    tx_hash: txid.clone(),
+                    first_seen_unix: now_unix,
+                };
+                self.transition_record_and_persist(draft_id, pending_status, now_unix)?;
+                Ok(BroadcastOutcome::Success(txid))
+            }
+            Err(err) => {
+                let is_transient = matches!(
+                    err,
+                    BtcBroadcastError::Timeout(_) | BtcBroadcastError::HttpError { status_code: 500..=599, .. }
+                );
+
+                if is_transient && attempt < max_retries {
+                    return Ok(BroadcastOutcome::Retry);
                 }
-                Err(err) => {
-                    let is_transient = matches!(
-                        err,
-                        BtcBroadcastError::Timeout(_) | BtcBroadcastError::HttpError { status_code: 500..=599, .. }
-                    );
 
-                    if is_transient && attempt < max_retries {
-                        // Will retry in next loop iteration
-                        continue;
-                    }
-
-                    let permanent = !is_transient;
-                    let failed_status = TxLifecycleStatus::Failed {
-                        stage: "broadcast".to_string(),
-                        error_message: err.to_string(),
-                        permanent,
-                    };
-                    self.transition_record_and_persist(draft_id, failed_status, now_unix)?;
-                    return Err(format!("BTC broadcast failed: {}", err));
-                }
+                let permanent = !is_transient;
+                let failed_status = TxLifecycleStatus::Failed {
+                    stage: "broadcast".to_string(),
+                    error_message: err.to_string(),
+                    permanent,
+                };
+                self.transition_record_and_persist(draft_id, failed_status, now_unix)?;
+                Ok(BroadcastOutcome::Failed(format!("BTC broadcast failed: {}", err)))
             }
         }
     }
 
-    pub fn execute_broadcast_bsc(
+    pub fn begin_broadcast_bsc(
         &mut self,
         draft_id: &str,
-        broadcaster: &dyn BscBroadcaster,
-        max_retries: u32,
+        attempt: u32,
         now_unix: u64,
-    ) -> Result<String, String> {
+    ) -> Result<BscBroadcastContext, String> {
         // Mandatory persistence configuration
         if self.storage_path.is_none() {
             return Err("Mandatory storage path is not configured on TxLifecycleCoordinator".to_string());
@@ -399,55 +429,115 @@ impl TxLifecycleCoordinator {
             )
         };
 
+        let broadcasting_status = TxLifecycleStatus::Broadcasting {
+            draft_id: draft_id.to_string(),
+            attempt,
+        };
+        // AUTO-PERSIST BEFORE NETWORK I/O (P1 Hardening)
+        self.transition_record_and_persist(draft_id, broadcasting_status, now_unix)?;
+
+        Ok(BscBroadcastContext {
+            raw_hex,
+            expected_sender,
+            expected_recipient,
+            expected_amount_raw,
+            expected_nonce,
+            expected_gas_limit,
+            expected_gas_price,
+            network,
+        })
+    }
+
+    pub fn complete_broadcast_bsc(
+        &mut self,
+        draft_id: &str,
+        result: Result<String, BscBroadcastError>,
+        attempt: u32,
+        max_retries: u32,
+        now_unix: u64,
+    ) -> Result<BroadcastOutcome, String> {
+        match result {
+            Ok(tx_hash) => {
+                let pending_status = TxLifecycleStatus::Pending {
+                    tx_hash: tx_hash.clone(),
+                    first_seen_unix: now_unix,
+                };
+                self.transition_record_and_persist(draft_id, pending_status, now_unix)?;
+                Ok(BroadcastOutcome::Success(tx_hash))
+            }
+            Err(err) => {
+                let is_transient = matches!(
+                    err,
+                    BscBroadcastError::Timeout(_) | BscBroadcastError::HttpError { status_code: 500..=599, .. }
+                );
+
+                if is_transient && attempt < max_retries {
+                    return Ok(BroadcastOutcome::Retry);
+                }
+
+                let permanent = !is_transient;
+                let failed_status = TxLifecycleStatus::Failed {
+                    stage: "broadcast".to_string(),
+                    error_message: err.to_string(),
+                    permanent,
+                };
+                self.transition_record_and_persist(draft_id, failed_status, now_unix)?;
+                Ok(BroadcastOutcome::Failed(format!("BSC broadcast failed: {}", err)))
+            }
+        }
+    }
+
+    pub fn execute_broadcast_btc(
+        &mut self,
+        draft_id: &str,
+        broadcaster: &dyn BtcBroadcaster,
+        max_retries: u32,
+        now_unix: u64,
+    ) -> Result<String, String> {
         let mut attempt = 0u32;
         loop {
             attempt += 1;
-            let broadcasting_status = TxLifecycleStatus::Broadcasting {
-                draft_id: draft_id.to_string(),
-                attempt,
-            };
-            // AUTO-PERSIST BEFORE NETWORK I/O (P1 Hardening)
-            self.transition_record_and_persist(draft_id, broadcasting_status, now_unix)?;
-
+            let ctx = self.begin_broadcast_btc(draft_id, attempt, now_unix)?;
             let broadcast_res = broadcaster.broadcast_verified(
-                &raw_hex,
-                &expected_sender,
-                &expected_recipient,
-                &expected_amount_raw,
-                expected_nonce,
-                expected_gas_limit,
-                &expected_gas_price,
-                network,
+                &ctx.raw_hex,
+                &ctx.expected_txid,
+                &ctx.expected_wtxid,
+                &ctx.approved_prevouts,
+                ctx.network,
             );
+            match self.complete_broadcast_btc(draft_id, broadcast_res, attempt, max_retries, now_unix)? {
+                BroadcastOutcome::Success(txid) => return Ok(txid),
+                BroadcastOutcome::Retry => continue,
+                BroadcastOutcome::Failed(err) => return Err(err),
+            }
+        }
+    }
 
-            match broadcast_res {
-                Ok(tx_hash) => {
-                    let pending_status = TxLifecycleStatus::Pending {
-                        tx_hash: tx_hash.clone(),
-                        first_seen_unix: now_unix,
-                    };
-                    self.transition_record_and_persist(draft_id, pending_status, now_unix)?;
-                    return Ok(tx_hash);
-                }
-                Err(err) => {
-                    let is_transient = matches!(
-                        err,
-                        BscBroadcastError::Timeout(_) | BscBroadcastError::HttpError { status_code: 500..=599, .. }
-                    );
-
-                    if is_transient && attempt < max_retries {
-                        continue;
-                    }
-
-                    let permanent = !is_transient;
-                    let failed_status = TxLifecycleStatus::Failed {
-                        stage: "broadcast".to_string(),
-                        error_message: err.to_string(),
-                        permanent,
-                    };
-                    self.transition_record_and_persist(draft_id, failed_status, now_unix)?;
-                    return Err(format!("BSC broadcast failed: {}", err));
-                }
+    pub fn execute_broadcast_bsc(
+        &mut self,
+        draft_id: &str,
+        broadcaster: &dyn BscBroadcaster,
+        max_retries: u32,
+        now_unix: u64,
+    ) -> Result<String, String> {
+        let mut attempt = 0u32;
+        loop {
+            attempt += 1;
+            let ctx = self.begin_broadcast_bsc(draft_id, attempt, now_unix)?;
+            let broadcast_res = broadcaster.broadcast_verified(
+                &ctx.raw_hex,
+                &ctx.expected_sender,
+                &ctx.expected_recipient,
+                &ctx.expected_amount_raw,
+                ctx.expected_nonce,
+                ctx.expected_gas_limit,
+                &ctx.expected_gas_price,
+                ctx.network,
+            );
+            match self.complete_broadcast_bsc(draft_id, broadcast_res, attempt, max_retries, now_unix)? {
+                BroadcastOutcome::Success(tx_hash) => return Ok(tx_hash),
+                BroadcastOutcome::Retry => continue,
+                BroadcastOutcome::Failed(err) => return Err(err),
             }
         }
     }

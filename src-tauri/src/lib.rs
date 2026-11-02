@@ -20,6 +20,7 @@ pub fn run() {
             wallet::prepare_bsc_transaction,
             wallet::confirm_and_sign_btc_draft,
             wallet::confirm_and_sign_bsc_draft,
+            wallet::preflight_signed_transaction,
             wallet::broadcast_signed_transaction,
             wallet::query_transaction_lifecycle
         ])

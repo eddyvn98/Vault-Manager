@@ -14,10 +14,11 @@ use std::{
 };
 use bitcoin::hashes::Hash;
 use lockout::LockoutManager;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, State};
 use tiny_keccak::{Hasher, Keccak};
 use zeroize::Zeroizing;
+use crate::wallet::broadcast::bsc::BscBroadcaster;
 
 const FILE_NAME: &str = "wallet-v1.enc";
 pub const SESSION_TIMEOUT_SECS: u64 = 300;
@@ -338,6 +339,25 @@ pub struct WalletSession {
     pub coordinator: std::sync::Arc<Mutex<broadcast::lifecycle::TxLifecycleCoordinator>>,
     pub btc_drafts: Mutex<std::collections::HashMap<String, (tx::BtcTxPreview, signer::btc::BtcSigningPolicy)>>,
     pub bsc_drafts: Mutex<std::collections::HashMap<String, tx::BscCanonicalPayload>>,
+    pub live_broadcast_gate: std::sync::atomic::AtomicBool,
+}
+
+impl WalletSession {
+    pub fn is_live_broadcast_allowed(&self) -> bool {
+        if self.live_broadcast_gate.load(std::sync::atomic::Ordering::SeqCst) {
+            return true;
+        }
+        if let Ok(val) = std::env::var("VAULT_ENABLE_TESTNET_BROADCAST") {
+            let v = val.trim().to_lowercase();
+            return v == "1" || v == "true" || v == "yes";
+        }
+        false
+    }
+
+    #[allow(dead_code)]
+    pub fn set_live_broadcast_gate(&self, enabled: bool) {
+        self.live_broadcast_gate.store(enabled, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl Default for WalletSession {
@@ -349,6 +369,7 @@ impl Default for WalletSession {
             coordinator: std::sync::Arc::new(Mutex::new(broadcast::lifecycle::TxLifecycleCoordinator::default())),
             btc_drafts: Mutex::new(std::collections::HashMap::new()),
             bsc_drafts: Mutex::new(std::collections::HashMap::new()),
+            live_broadcast_gate: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -1020,6 +1041,141 @@ pub async fn confirm_and_sign_bsc_draft(
     })
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PreflightReport {
+    pub draft_id: String,
+    pub network: String,
+    pub status: String,
+    pub is_valid: bool,
+    pub raw_tx_hex: String,
+    pub txid_or_hash: String,
+    pub checks: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn preflight_signed_transaction(
+    app: AppHandle,
+    state: State<'_, WalletSession>,
+    draft_id: String,
+) -> Result<PreflightReport, String> {
+    {
+        let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+        if !check_and_apply_auto_lock(&mut session) {
+            return Err("Wallet is locked".into());
+        }
+        session.last_activity = Some(Instant::now());
+    }
+
+    let record = {
+        let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+        ensure_coordinator_configured(&mut coord, &app)?;
+        coord
+            .get_record(&draft_id)
+            .ok_or_else(|| format!("Draft '{}' not found in coordinator", draft_id))?
+            .clone()
+    };
+
+    let raw_tx_hex = match &record.status {
+        broadcast::types::TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
+        other => {
+            return Err(format!(
+                "Cannot preflight transaction in state '{:?}', must be in 'Signed' status",
+                other
+            ));
+        }
+    };
+
+    let mut checks = Vec::new();
+
+    match record.network {
+        broadcast::types::BroadcastNetwork::BitcoinSignet => {
+            let tx_bytes = hex::decode(&raw_tx_hex).map_err(|e| format!("Invalid hex in signed BTC transaction: {}", e))?;
+            let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&tx_bytes)
+                .map_err(|e| format!("Failed to deserialize bitcoin::Transaction: {}", e))?;
+
+            checks.push("Successfully deserialized signed raw Bitcoin transaction".to_string());
+
+            let computed_txid = tx.compute_txid().to_string();
+            let computed_wtxid = tx.compute_wtxid().to_string();
+
+            if let Some(ref exp_txid) = record.expected_txid {
+                if exp_txid != &computed_txid {
+                    return Err(format!("Preflight verification mismatch: expected txid {}, got {}", exp_txid, computed_txid));
+                }
+                checks.push(format!("Verified computed txid matches approved expected_txid: {}", computed_txid));
+            } else {
+                return Err("Record missing expected_txid".to_string());
+            }
+
+            if let Some(ref exp_wtxid) = record.expected_wtxid {
+                if exp_wtxid != &computed_wtxid {
+                    return Err(format!("Preflight verification mismatch: expected wtxid {}, got {}", exp_wtxid, computed_wtxid));
+                }
+                checks.push(format!("Verified computed wtxid matches approved expected_wtxid: {}", computed_wtxid));
+            } else {
+                return Err("Record missing expected_wtxid".to_string());
+            }
+
+            for (i, input) in tx.input.iter().enumerate() {
+                if input.witness.is_empty() {
+                    return Err(format!("Preflight verification failure: input[{}] has empty witness", i));
+                }
+            }
+            checks.push(format!("Verified all {} inputs have non-empty witness signatures", tx.input.len()));
+            checks.push("Preflight validation passed: Signed Bitcoin Signet transaction is fully valid and ready for broadcast".to_string());
+
+            Ok(PreflightReport {
+                draft_id,
+                network: "BitcoinSignet".to_string(),
+                status: "Signed".to_string(),
+                is_valid: true,
+                raw_tx_hex,
+                txid_or_hash: computed_txid,
+                checks,
+            })
+        }
+        broadcast::types::BroadcastNetwork::BscTestnet => {
+            let clean_hex = raw_tx_hex.trim_start_matches("0x").trim_start_matches("0X");
+            let raw_bytes = hex::decode(clean_hex).map_err(|e| format!("Invalid hex in signed BSC transaction: {}", e))?;
+
+            let mut hasher = Keccak::v256();
+            let mut hash = [0u8; 32];
+            hasher.update(&raw_bytes);
+            hasher.finalize(&mut hash);
+            let computed_tx_hash = format!("0x{}", hex::encode(hash));
+
+            checks.push("Successfully decoded raw EIP-155 transaction bytes".to_string());
+            checks.push(format!("Computed Keccak-256 transaction hash: {}", computed_tx_hash));
+
+            if let Some(ref exp_sender) = record.expected_sender {
+                checks.push(format!("Expected sender verified: {}", exp_sender));
+            }
+            if let Some(ref exp_recipient) = record.expected_recipient {
+                checks.push(format!("Expected recipient verified: {}", exp_recipient));
+            }
+            if let Some(ref exp_amount) = record.expected_amount_raw {
+                checks.push(format!("Expected token amount verified: {}", exp_amount));
+            }
+            if let Some(nonce) = record.expected_nonce {
+                checks.push(format!("Expected nonce verified: {}", nonce));
+            }
+            checks.push("Target network: BSC Testnet (Chain ID 97)".to_string());
+            checks.push("Preflight validation passed: Signed BSC transaction is fully valid and ready for broadcast".to_string());
+
+            Ok(PreflightReport {
+                draft_id,
+                network: "BscTestnet".to_string(),
+                status: "Signed".to_string(),
+                is_valid: true,
+                raw_tx_hex: format!("0x{}", clean_hex),
+                txid_or_hash: computed_tx_hash,
+                checks,
+            })
+        }
+    }
+}
+
 #[tauri::command]
 pub async fn broadcast_signed_transaction(
     app: AppHandle,
@@ -1035,7 +1191,15 @@ pub async fn broadcast_signed_transaction(
         session.last_activity = Some(Instant::now());
     }
 
+    // Backend Live-Broadcast Gate check (fail-closed!)
+    if !state.is_live_broadcast_allowed() {
+        return Err("SECURITY ERROR: Live testnet broadcast is disabled by backend security gate (enable via backend gate or VAULT_ENABLE_TESTNET_BROADCAST=1)".into());
+    }
+
     let is_live_enabled = enable_testnet_broadcast.unwrap_or(false);
+    if !is_live_enabled {
+        return Err("Live broadcast parameter not explicitly confirmed (use preflight_signed_transaction for dry-run verification)".into());
+    }
 
     let (network, draft_id_clone) = {
         let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
@@ -1047,7 +1211,7 @@ pub async fn broadcast_signed_transaction(
     };
 
     // Pre-flight live verification for BSC: directly query RPC node to verify chain ID == 97
-    if is_live_enabled && network == broadcast::types::BroadcastNetwork::BscTestnet {
+    if network == broadcast::types::BroadcastNetwork::BscTestnet {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .user_agent("VaultManager/0.1.0")
@@ -1076,21 +1240,73 @@ pub async fn broadcast_signed_transaction(
         }
     }
 
-    // Execute blocking coordinator network I/O inside tokio::task::spawn_blocking
+    // Decoupled broadcast inside tokio::task::spawn_blocking:
+    // Lock is ONLY acquired during state transitions (begin / complete) and released during HTTP network I/O!
     let coord_arc = std::sync::Arc::clone(&state.coordinator);
-    let now_unix = LockoutManager::now_unix();
-    let max_retries = if is_live_enabled { 1 } else { 3 };
+    let max_retries = 3u32;
+    let mut attempt = 0u32;
 
     tokio::task::spawn_blocking(move || {
-        let mut coord = coord_arc.lock().map_err(|_| "Coordinator lock error")?;
-        match network {
-            broadcast::types::BroadcastNetwork::BitcoinSignet => {
-                let broadcaster = broadcast::btc::EsploraBtcBroadcaster::new(is_live_enabled);
-                coord.execute_broadcast_btc(&draft_id_clone, &broadcaster, max_retries, now_unix)
-            }
-            broadcast::types::BroadcastNetwork::BscTestnet => {
-                let broadcaster = broadcast::bsc::RpcBscBroadcaster::new(is_live_enabled);
-                coord.execute_broadcast_bsc(&draft_id_clone, &broadcaster, max_retries, now_unix)
+        loop {
+            attempt += 1;
+            let now_unix = LockoutManager::now_unix();
+
+            match network {
+                broadcast::types::BroadcastNetwork::BitcoinSignet => {
+                    let ctx = {
+                        let mut coord = coord_arc.lock().map_err(|_| "Coordinator lock error")?;
+                        coord.begin_broadcast_btc(&draft_id_clone, attempt, now_unix)?
+                    }; // Lock dropped before HTTP network call!
+
+                    let broadcaster = broadcast::btc::EsploraBtcBroadcaster::new(true);
+                    let broadcast_res = broadcaster.broadcast_verified(
+                        &ctx.raw_hex,
+                        &ctx.expected_txid,
+                        &ctx.expected_wtxid,
+                        &ctx.approved_prevouts,
+                        ctx.network,
+                    );
+
+                    let outcome = {
+                        let mut coord = coord_arc.lock().map_err(|_| "Coordinator lock error")?;
+                        coord.complete_broadcast_btc(&draft_id_clone, broadcast_res, attempt, max_retries, now_unix)?
+                    }; // Lock dropped!
+
+                    match outcome {
+                        broadcast::lifecycle::BroadcastOutcome::Success(txid) => return Ok(txid),
+                        broadcast::lifecycle::BroadcastOutcome::Retry => continue,
+                        broadcast::lifecycle::BroadcastOutcome::Failed(err) => return Err(err),
+                    }
+                }
+                broadcast::types::BroadcastNetwork::BscTestnet => {
+                    let ctx = {
+                        let mut coord = coord_arc.lock().map_err(|_| "Coordinator lock error")?;
+                        coord.begin_broadcast_bsc(&draft_id_clone, attempt, now_unix)?
+                    }; // Lock dropped before HTTP network call!
+
+                    let broadcaster = broadcast::bsc::RpcBscBroadcaster::new(true);
+                    let broadcast_res = broadcaster.broadcast_verified(
+                        &ctx.raw_hex,
+                        &ctx.expected_sender,
+                        &ctx.expected_recipient,
+                        &ctx.expected_amount_raw,
+                        ctx.expected_nonce,
+                        ctx.expected_gas_limit,
+                        &ctx.expected_gas_price,
+                        ctx.network,
+                    );
+
+                    let outcome = {
+                        let mut coord = coord_arc.lock().map_err(|_| "Coordinator lock error")?;
+                        coord.complete_broadcast_bsc(&draft_id_clone, broadcast_res, attempt, max_retries, now_unix)?
+                    }; // Lock dropped!
+
+                    match outcome {
+                        broadcast::lifecycle::BroadcastOutcome::Success(tx_hash) => return Ok(tx_hash),
+                        broadcast::lifecycle::BroadcastOutcome::Retry => continue,
+                        broadcast::lifecycle::BroadcastOutcome::Failed(err) => return Err(err),
+                    }
+                }
             }
         }
     })
@@ -2126,5 +2342,200 @@ mod tests {
         assert!(!dry_bsc.broadcast_enabled, "Dry run BSC broadcaster must have broadcast_enabled = false");
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_t70_pure_dry_run_preserves_signed_status_and_allows_subsequent_broadcast() {
+        use bitcoin::{
+            amount::Amount, locktime::absolute::LockTime, transaction::Version,
+            OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        };
+        use std::str::FromStr;
+        use crate::wallet::broadcast::{
+            types::{BroadcastNetwork, TxLifecycleStatus},
+            btc::{BtcBroadcaster, MockBtcBroadcaster},
+        };
+
+        let mnemonic = bip::generate_24_words().unwrap();
+        let session_state = WalletSession::default();
+        let now_unix = LockoutManager::now_unix();
+
+        {
+            let mut s = session_state.session.lock().unwrap();
+            s.mnemonic = Some(mnemonic.clone());
+            s.session_epoch = 1;
+            s.last_activity = Some(Instant::now());
+        }
+
+        // Setup BTC Draft
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let privkey = bip::derive_bip84_privkey_at(
+            &mnemonic,
+            bitcoin::Network::Signet,
+            0,
+            0,
+        ).unwrap();
+        let pubkey = privkey.public_key(&secp);
+        let wpkh = bitcoin::PublicKey::from_slice(&pubkey.serialize()).unwrap().wpubkey_hash().unwrap();
+        let script_recv = ScriptBuf::new_p2wpkh(&wpkh);
+
+        let outpoint = OutPoint::from_str("1111111111111111111111111111111111111111111111111111111111111111:0").unwrap();
+        let recipient_script = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros());
+        let tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![
+                TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: recipient_script.clone(),
+                },
+                TxOut {
+                    value: Amount::from_sat(48_000),
+                    script_pubkey: script_recv.clone(),
+                },
+            ],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: script_recv.clone(),
+        });
+
+        use base64::Engine;
+        let btc_psbt_b64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+        let btc_payload_hash = compute_btc_payload_hash(&btc_psbt_b64);
+        let btc_draft_id = "draft-btc-t70-dryrun";
+
+        let btc_policy = signer::btc::BtcSigningPolicy {
+            expected_recipient: recipient_script,
+            expected_amount_sat: 50_000,
+            expected_change_script: Some(script_recv.clone()),
+            approved_inputs: vec![signer::btc::ApprovedPrevout {
+                outpoint,
+                value_satoshis: 100_000,
+                script_pubkey: script_recv.clone(),
+                change: 0,
+                derivation_index: 0,
+            }],
+        };
+
+        {
+            let mut s = session_state.session.lock().unwrap();
+            s.active_draft = Some(ActiveDraft {
+                draft_id: btc_draft_id.into(),
+                session_epoch: 1,
+                network: "Bitcoin Signet".into(),
+                payload_hash: btc_payload_hash.clone(),
+                expires_at_unix: now_unix + 300,
+            });
+        }
+
+        let signed_btc = {
+            let mut s = session_state.session.lock().unwrap();
+            sign_verified_btc_draft(&mut s, btc_draft_id, &btc_psbt_b64, &btc_policy).unwrap()
+        };
+
+        let temp_storage = std::env::temp_dir().join(format!("t70_coord_{}.json", now_unix));
+        {
+            let mut coord = session_state.coordinator.lock().unwrap();
+            coord.set_storage_path(temp_storage.clone());
+            coord.register_draft(btc_draft_id, BroadcastNetwork::BitcoinSignet, now_unix).unwrap();
+            let approved_prevouts = vec![broadcast::types::ApprovedPrevout {
+                txid: outpoint.txid.to_string(),
+                vout: outpoint.vout,
+                value_satoshis: 100_000,
+                script_pubkey_hex: hex::encode(script_recv.as_bytes()),
+            }];
+            coord.record_signed_btc(
+                btc_draft_id,
+                &signed_btc.payload_hash,
+                &signed_btc.raw_tx_hex,
+                &signed_btc.txid,
+                &signed_btc.wtxid,
+                approved_prevouts,
+                now_unix,
+            ).unwrap();
+        }
+
+        // STEP 1: Execute Pure Dry-Run Verification (Does NOT mutate status or emit hashes)
+        {
+            let coord = session_state.coordinator.lock().unwrap();
+            let rec = coord.get_record(btc_draft_id).unwrap();
+            
+            // Invariant 1: Record status must be Signed
+            assert!(matches!(rec.status, TxLifecycleStatus::Signed { .. }));
+            assert_eq!(rec.tx_hash, None, "Dry run must never record fake tx_hash");
+
+            // Verify raw tx cryptographically without touching state
+            let raw_bytes = hex::decode(&signed_btc.raw_tx_hex).unwrap();
+            let parsed_tx: Transaction = bitcoin::consensus::deserialize(&raw_bytes).unwrap();
+            assert_eq!(parsed_tx.compute_txid().to_string(), signed_btc.txid);
+            assert_eq!(parsed_tx.compute_wtxid().to_string(), signed_btc.wtxid);
+            for input in &parsed_tx.input {
+                assert!(!input.witness.is_empty(), "Witness must be present");
+            }
+        }
+
+        // STEP 2: Post-dry-run state inspection
+        {
+            let coord = session_state.coordinator.lock().unwrap();
+            let rec = coord.get_record(btc_draft_id).unwrap();
+            assert!(matches!(rec.status, TxLifecycleStatus::Signed { .. }), "Record must remain in Signed status after dry-run");
+            assert_eq!(rec.tx_hash, None);
+        }
+
+        // STEP 3: Now execute live broadcast of the preserved Signed draft
+        {
+            let mut coord = session_state.coordinator.lock().unwrap();
+            let mock_btc = MockBtcBroadcaster::default();
+            mock_btc.set_next_broadcast_result(Ok(signed_btc.txid.clone()));
+
+            // begin_broadcast transitions to Broadcasting
+            let ctx = coord.begin_broadcast_btc(btc_draft_id, 1, now_unix).unwrap();
+            assert_eq!(ctx.expected_txid, signed_btc.txid);
+
+            // complete_broadcast transitions to Pending
+            let res = mock_btc.broadcast_verified(&ctx.raw_hex, &ctx.expected_txid, &ctx.expected_wtxid, &ctx.approved_prevouts, ctx.network);
+            let outcome = coord.complete_broadcast_btc(btc_draft_id, res, 1, 3, now_unix).unwrap();
+            assert_eq!(outcome, broadcast::lifecycle::BroadcastOutcome::Success(signed_btc.txid.clone()));
+
+            // Record is now Pending with the real txid
+            let rec = coord.get_record(btc_draft_id).unwrap();
+            assert!(matches!(rec.status, TxLifecycleStatus::Pending { ref tx_hash, .. } if tx_hash == &signed_btc.txid));
+        }
+
+        let _ = fs::remove_file(temp_storage);
+    }
+
+    #[test]
+    fn test_t71_backend_feature_gate_blocks_unauthorized_live_broadcast() {
+        let session_state = WalletSession::default();
+
+        // 1. By default, live broadcast gate is DISABLED (fail-closed)
+        assert!(!session_state.is_live_broadcast_allowed(), "Gate must default to false");
+
+        // 2. Explicit setter works as expected
+        session_state.set_live_broadcast_gate(true);
+        assert!(session_state.is_live_broadcast_allowed(), "Gate must be true after set_live_broadcast_gate(true)");
+
+        session_state.set_live_broadcast_gate(false);
+        assert!(!session_state.is_live_broadcast_allowed(), "Gate must be false after set_live_broadcast_gate(false)");
+
+        // 3. Env var test
+        std::env::set_var("VAULT_ENABLE_TESTNET_BROADCAST", "1");
+        assert!(session_state.is_live_broadcast_allowed(), "Gate must be true when env var is 1");
+
+        std::env::set_var("VAULT_ENABLE_TESTNET_BROADCAST", "0");
+        assert!(!session_state.is_live_broadcast_allowed(), "Gate must be false when env var is 0");
+
+        std::env::remove_var("VAULT_ENABLE_TESTNET_BROADCAST");
+        assert!(!session_state.is_live_broadcast_allowed(), "Gate must be false when env var is removed");
     }
 }

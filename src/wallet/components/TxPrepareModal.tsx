@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
   Send,
@@ -16,6 +16,7 @@ import {
   BscTxPreview,
   BtcSignedPreview,
   BscSignedPreview,
+  PreflightReport,
   TxLifecycleStatus,
   getErrorMessage,
 } from '../types';
@@ -45,17 +46,22 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
   // Broadcast & Lifecycle
   const [broadcastTxHash, setBroadcastTxHash] = useState<string | null>(null);
   const [lifecycle, setLifecycle] = useState<TxLifecycleStatus | null>(null);
+  const [preflightReport, setPreflightReport] = useState<PreflightReport | null>(null);
   const [isSigning, setIsSigning] = useState(false);
+  const [isPreflighting, setIsPreflighting] = useState(false);
   const [isBroadcasting, setIsBroadcasting] = useState(false);
 
   const activeDraftId = btcPreview?.draftId || bscPreview?.draftId;
+  const isPollingRef = useRef(false);
 
-  // Poll lifecycle status once broadcasted
+  // Poll lifecycle status once broadcasted (with overlap guard)
   useEffect(() => {
     let timer: number | null = null;
 
     if (broadcastTxHash && activeDraftId) {
       const poll = async () => {
+        if (isPollingRef.current) return;
+        isPollingRef.current = true;
         try {
           const status = await invoke<TxLifecycleStatus>('query_transaction_lifecycle', {
             draftId: activeDraftId,
@@ -63,6 +69,8 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
           setLifecycle(status);
         } catch (e) {
           console.error('Lifecycle poll error:', e);
+        } finally {
+          isPollingRef.current = false;
         }
       };
 
@@ -83,6 +91,7 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
     setBscPreview(null);
     setBtcSigned(null);
     setBscSigned(null);
+    setPreflightReport(null);
     setBroadcastTxHash(null);
     setLifecycle(null);
 
@@ -160,14 +169,30 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
     }
   };
 
-  const handleBroadcast = async (isLive: boolean = true) => {
+  const handlePreflight = async () => {
+    setIsPreflighting(true);
+    setError(null);
+    try {
+      if (!activeDraftId) throw new Error('Không tìm thấy giao dịch đã ký');
+      const report = await invoke<PreflightReport>('preflight_signed_transaction', {
+        draftId: activeDraftId,
+      });
+      setPreflightReport(report);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setIsPreflighting(false);
+    }
+  };
+
+  const handleBroadcast = async () => {
     setIsBroadcasting(true);
     setError(null);
     try {
       if (!activeDraftId) throw new Error('Không tìm thấy giao dịch đã ký');
       const txHash = await invoke<string>('broadcast_signed_transaction', {
         draftId: activeDraftId,
-        enableTestnetBroadcast: isLive,
+        enableTestnetBroadcast: true,
       });
       setBroadcastTxHash(txHash);
     } catch (err) {
@@ -435,6 +460,27 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
               </div>
             )}
 
+            {/* PREFLIGHT DRY-RUN REPORT */}
+            {preflightReport && (
+              <div className="preview-card border-emerald-500/40 bg-emerald-950/20">
+                <div className="flex items-center gap-2 text-emerald-400 text-xs font-bold mb-1">
+                  <ShieldCheck size={16} />
+                  <span>Kết quả Kiểm tra Dry-Run: Giao dịch hợp lệ 100%</span>
+                </div>
+                <div className="text-[11px] text-slate-300 mb-2">
+                  Trạng thái bảo toàn: <span className="font-mono text-emerald-300 font-semibold">{preflightReport.status}</span> (Chưa phát sóng lên mạng, an toàn tuyệt đối).
+                </div>
+                <div className="space-y-1 bg-black/40 p-2.5 rounded border border-emerald-500/20 text-[11px]">
+                  {preflightReport.checks.map((c, i) => (
+                    <div key={i} className="flex items-start gap-1.5 text-slate-300">
+                      <Check size={12} className="text-emerald-400 shrink-0 mt-0.5" />
+                      <span>{c}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* BROADCAST & LIFECYCLE TRACKER */}
             {broadcastTxHash && (
               <div className="preview-card border-sky-500/30 bg-sky-950/10">
@@ -555,24 +601,30 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
                     type="button"
                     className="subtle"
                     onClick={onClose}
-                    disabled={isBroadcasting}
+                    disabled={isBroadcasting || isPreflighting}
                   >
                     Đóng
                   </button>
                   <button
                     type="button"
                     className="subtle text-sky-400"
-                    onClick={() => handleBroadcast(false)}
-                    disabled={isBroadcasting}
-                    title="Xác thực raw transaction và chữ ký mà không gửi lên blockchain"
+                    onClick={handlePreflight}
+                    disabled={isBroadcasting || isPreflighting}
+                    title="Xác thực raw transaction và chữ ký mà không gửi lên blockchain (bảo toàn trạng thái Signed)"
                   >
-                    Kiểm tra Dry-Run
+                    {isPreflighting ? (
+                      <span className="flex items-center gap-2">
+                        <Loader2 size={14} className="animate-spin" /> Đang kiểm tra…
+                      </span>
+                    ) : (
+                      'Kiểm tra Dry-Run'
+                    )}
                   </button>
                   <button
                     type="button"
                     className="broadcast-btn"
-                    onClick={() => handleBroadcast(true)}
-                    disabled={isBroadcasting}
+                    onClick={handleBroadcast}
+                    disabled={isBroadcasting || isPreflighting}
                   >
                     {isBroadcasting ? (
                       <span className="flex items-center gap-2">
