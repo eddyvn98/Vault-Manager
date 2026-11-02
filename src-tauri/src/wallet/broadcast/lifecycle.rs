@@ -13,6 +13,7 @@ struct LifecycleSnapshot {
 }
 
 #[allow(dead_code)]
+#[derive(Debug)]
 pub struct TxLifecycleCoordinator {
     records: HashMap<String, TxLifecycleRecord>,
     confirmed_block_hashes: HashMap<String, (u64, String)>, // tx_hash -> (block_height, block_hash)

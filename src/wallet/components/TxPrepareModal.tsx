@@ -160,13 +160,14 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
     }
   };
 
-  const handleBroadcast = async () => {
+  const handleBroadcast = async (isLive: boolean = true) => {
     setIsBroadcasting(true);
     setError(null);
     try {
       if (!activeDraftId) throw new Error('Không tìm thấy giao dịch đã ký');
       const txHash = await invoke<string>('broadcast_signed_transaction', {
         draftId: activeDraftId,
+        enableTestnetBroadcast: isLive,
       });
       setBroadcastTxHash(txHash);
     } catch (err) {
@@ -560,8 +561,17 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
                   </button>
                   <button
                     type="button"
+                    className="subtle text-sky-400"
+                    onClick={() => handleBroadcast(false)}
+                    disabled={isBroadcasting}
+                    title="Xác thực raw transaction và chữ ký mà không gửi lên blockchain"
+                  >
+                    Kiểm tra Dry-Run
+                  </button>
+                  <button
+                    type="button"
                     className="broadcast-btn"
-                    onClick={handleBroadcast}
+                    onClick={() => handleBroadcast(true)}
                     disabled={isBroadcasting}
                   >
                     {isBroadcasting ? (

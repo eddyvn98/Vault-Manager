@@ -335,7 +335,7 @@ pub struct WalletSession {
     pub session: Mutex<SessionState>,
     pub is_preparing: std::sync::atomic::AtomicBool,
     pub sqlite_tracker: std::sync::Arc<SqliteTracker>,
-    pub coordinator: Mutex<broadcast::lifecycle::TxLifecycleCoordinator>,
+    pub coordinator: std::sync::Arc<Mutex<broadcast::lifecycle::TxLifecycleCoordinator>>,
     pub btc_drafts: Mutex<std::collections::HashMap<String, (tx::BtcTxPreview, signer::btc::BtcSigningPolicy)>>,
     pub bsc_drafts: Mutex<std::collections::HashMap<String, tx::BscCanonicalPayload>>,
 }
@@ -346,7 +346,7 @@ impl Default for WalletSession {
             session: Mutex::new(SessionState::default()),
             is_preparing: std::sync::atomic::AtomicBool::new(false),
             sqlite_tracker: std::sync::Arc::new(SqliteTracker::default()),
-            coordinator: Mutex::new(broadcast::lifecycle::TxLifecycleCoordinator::default()),
+            coordinator: std::sync::Arc::new(Mutex::new(broadcast::lifecycle::TxLifecycleCoordinator::default())),
             btc_drafts: Mutex::new(std::collections::HashMap::new()),
             bsc_drafts: Mutex::new(std::collections::HashMap::new()),
         }
@@ -365,13 +365,9 @@ pub fn ensure_coordinator_configured(
         let _ = fs::create_dir_all(&app_dir);
         let path = app_dir.join("tx_lifecycle.json");
         if path.exists() {
-            match broadcast::lifecycle::TxLifecycleCoordinator::load_from_file(&path) {
-                Ok(loaded) => *coordinator = loaded,
-                Err(e) => {
-                    eprintln!("Warning: could not load existing lifecycle file: {}", e);
-                    coordinator.set_storage_path(path);
-                }
-            }
+            let loaded = broadcast::lifecycle::TxLifecycleCoordinator::load_from_file(&path)
+                .map_err(|e| format!("SECURITY ERROR: Corrupted tx_lifecycle.json at {:?}: {}. Please inspect or restore backup file.", path, e))?;
+            *coordinator = loaded;
         } else {
             coordinator.set_storage_path(path);
         }
@@ -1029,6 +1025,7 @@ pub async fn broadcast_signed_transaction(
     app: AppHandle,
     state: State<'_, WalletSession>,
     draft_id: String,
+    enable_testnet_broadcast: Option<bool>,
 ) -> Result<String, String> {
     {
         let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
@@ -1037,6 +1034,8 @@ pub async fn broadcast_signed_transaction(
         }
         session.last_activity = Some(Instant::now());
     }
+
+    let is_live_enabled = enable_testnet_broadcast.unwrap_or(false);
 
     let (network, draft_id_clone) = {
         let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
@@ -1047,21 +1046,56 @@ pub async fn broadcast_signed_transaction(
         (record.network, draft_id.clone())
     };
 
-    let now_unix = LockoutManager::now_unix();
-    let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+    // Pre-flight live verification for BSC: directly query RPC node to verify chain ID == 97
+    if is_live_enabled && network == broadcast::types::BroadcastNetwork::BscTestnet {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent("VaultManager/0.1.0")
+            .build()
+            .map_err(|e| format!("Failed to build HTTP client for chain ID verification: {}", e))?;
+        
+        let res = client
+            .post("https://bsc-testnet.publicnode.com")
+            .json(&serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_chainId",
+                "params": [],
+                "id": 97
+            }))
+            .send()
+            .await
+            .map_err(|e| format!("Pre-broadcast RPC chain ID query failed: {}", e))?;
 
-    match network {
-        broadcast::types::BroadcastNetwork::BitcoinSignet => {
-            let broadcaster = broadcast::btc::EsploraBtcBroadcaster::new(true);
-            let txid = coord.execute_broadcast_btc(&draft_id_clone, &broadcaster, 3, now_unix)?;
-            Ok(txid)
-        }
-        broadcast::types::BroadcastNetwork::BscTestnet => {
-            let broadcaster = broadcast::bsc::RpcBscBroadcaster::new(true);
-            let tx_hash = coord.execute_broadcast_bsc(&draft_id_clone, &broadcaster, 3, now_unix)?;
-            Ok(tx_hash)
+        let body: serde_json::Value = res.json().await
+            .map_err(|e| format!("Failed to parse RPC response: {}", e))?;
+        let hex_chain_id = body.get("result").and_then(|v| v.as_str()).ok_or("Missing result in eth_chainId response")?;
+        let chain_id = u64::from_str_radix(hex_chain_id.trim_start_matches("0x").trim_start_matches("0X"), 16)
+            .map_err(|e| format!("Invalid hex chainId: {}", e))?;
+        if chain_id != 97 {
+            return Err(format!("SECURITY ERROR: Target node reports chain ID {}, expected BSC Testnet 97 (0x61)", chain_id));
         }
     }
+
+    // Execute blocking coordinator network I/O inside tokio::task::spawn_blocking
+    let coord_arc = std::sync::Arc::clone(&state.coordinator);
+    let now_unix = LockoutManager::now_unix();
+    let max_retries = if is_live_enabled { 1 } else { 3 };
+
+    tokio::task::spawn_blocking(move || {
+        let mut coord = coord_arc.lock().map_err(|_| "Coordinator lock error")?;
+        match network {
+            broadcast::types::BroadcastNetwork::BitcoinSignet => {
+                let broadcaster = broadcast::btc::EsploraBtcBroadcaster::new(is_live_enabled);
+                coord.execute_broadcast_btc(&draft_id_clone, &broadcaster, max_retries, now_unix)
+            }
+            broadcast::types::BroadcastNetwork::BscTestnet => {
+                let broadcaster = broadcast::bsc::RpcBscBroadcaster::new(is_live_enabled);
+                coord.execute_broadcast_bsc(&draft_id_clone, &broadcaster, max_retries, now_unix)
+            }
+        }
+    })
+    .await
+    .map_err(|e| format!("Background broadcast task panicked: {}", e))?
 }
 
 #[tauri::command]
@@ -1070,39 +1104,49 @@ pub async fn query_transaction_lifecycle(
     state: State<'_, WalletSession>,
     draft_id: String,
 ) -> Result<broadcast::types::TxLifecycleStatus, String> {
-    let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
-    ensure_coordinator_configured(&mut coord, &app)?;
+    let (network, _is_onchain) = {
+        let mut coord = state.coordinator.lock().map_err(|_| "Coordinator lock error")?;
+        ensure_coordinator_configured(&mut coord, &app)?;
 
-    let record = coord
-        .get_record(&draft_id)
-        .ok_or_else(|| format!("Draft '{}' not found in coordinator", draft_id))?;
+        let record = coord
+            .get_record(&draft_id)
+            .ok_or_else(|| format!("Draft '{}' not found in coordinator", draft_id))?;
 
-    let is_onchain = matches!(
-        record.status,
-        broadcast::types::TxLifecycleStatus::Broadcasting { .. }
-            | broadcast::types::TxLifecycleStatus::Pending { .. }
-            | broadcast::types::TxLifecycleStatus::Confirmed { .. }
-            | broadcast::types::TxLifecycleStatus::ReorgDetected { .. }
-            | broadcast::types::TxLifecycleStatus::Failed { permanent: false, .. }
-    );
+        let onchain = matches!(
+            record.status,
+            broadcast::types::TxLifecycleStatus::Broadcasting { .. }
+                | broadcast::types::TxLifecycleStatus::Pending { .. }
+                | broadcast::types::TxLifecycleStatus::Confirmed { .. }
+                | broadcast::types::TxLifecycleStatus::ReorgDetected { .. }
+                | broadcast::types::TxLifecycleStatus::Failed { permanent: false, .. }
+        );
 
-    if !is_onchain {
-        return Ok(record.status.clone());
-    }
+        if !onchain {
+            return Ok(record.status.clone());
+        }
 
-    let network = record.network;
+        (record.network, onchain)
+    };
+
+    let coord_arc = std::sync::Arc::clone(&state.coordinator);
     let now_unix = LockoutManager::now_unix();
+    let draft_id_clone = draft_id.clone();
 
-    match network {
-        broadcast::types::BroadcastNetwork::BitcoinSignet => {
-            let broadcaster = broadcast::btc::EsploraBtcBroadcaster::new(true);
-            coord.poll_btc_lifecycle(&draft_id, &broadcaster, now_unix)
+    tokio::task::spawn_blocking(move || {
+        let mut coord = coord_arc.lock().map_err(|_| "Coordinator lock error")?;
+        match network {
+            broadcast::types::BroadcastNetwork::BitcoinSignet => {
+                let broadcaster = broadcast::btc::EsploraBtcBroadcaster::new(true);
+                coord.poll_btc_lifecycle(&draft_id_clone, &broadcaster, now_unix)
+            }
+            broadcast::types::BroadcastNetwork::BscTestnet => {
+                let broadcaster = broadcast::bsc::RpcBscBroadcaster::new(true);
+                coord.poll_bsc_lifecycle(&draft_id_clone, &broadcaster, now_unix)
+            }
         }
-        broadcast::types::BroadcastNetwork::BscTestnet => {
-            let broadcaster = broadcast::bsc::RpcBscBroadcaster::new(true);
-            coord.poll_bsc_lifecycle(&draft_id, &broadcaster, now_unix)
-        }
-    }
+    })
+    .await
+    .map_err(|e| format!("Background polling task panicked: {}", e))?
 }
 
 pub fn cleanup_sqlite_files(app_dir: &std::path::Path) -> Result<(), String> {
@@ -1796,7 +1840,7 @@ mod tests {
     }
 
     #[test]
-    fn test_t68_tauri_command_lifecycle_e2e() {
+    fn test_t68_offline_signing_coordinator_mock_e2e() {
         use bitcoin::{
             amount::Amount, hashes::Hash, locktime::absolute::LockTime, transaction::Version,
             OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
@@ -2049,5 +2093,38 @@ mod tests {
 
             let _ = fs::remove_file(temp_storage);
         }
+    }
+
+    #[test]
+    fn test_t69_corrupted_lifecycle_fail_closed_and_dry_run_flag() {
+        use std::io::Write;
+        let temp_dir = std::env::temp_dir().join(format!("t69_test_{}", LockoutManager::now_unix()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let corrupt_path = temp_dir.join("tx_lifecycle.json");
+
+        // 1. Write corrupted JSON to tx_lifecycle.json
+        {
+            let mut f = fs::File::create(&corrupt_path).unwrap();
+            f.write_all(b"{\"records\": [corrupted truncated json...").unwrap();
+            f.sync_all().unwrap();
+        }
+
+        // 2. Loading corrupted file must FAIL-CLOSED immediately
+        let load_res = broadcast::lifecycle::TxLifecycleCoordinator::load_from_file(&corrupt_path);
+        assert!(load_res.is_err(), "Corrupted lifecycle file must fail-closed");
+        let err_msg = load_res.unwrap_err();
+        assert!(err_msg.contains("Cannot parse lifecycle file"), "Must report parse failure: {}", err_msg);
+
+        // 3. Corrupted file must NOT be overwritten or clobbered
+        assert!(corrupt_path.exists(), "Corrupted file must be preserved for forensic analysis");
+
+        // 4. Test dry-run broadcaster: EsploraBtcBroadcaster::new(false) and RpcBscBroadcaster::new(false)
+        let dry_btc = broadcast::btc::EsploraBtcBroadcaster::new(false);
+        assert!(!dry_btc.broadcast_enabled, "Dry run BTC broadcaster must have broadcast_enabled = false");
+
+        let dry_bsc = broadcast::bsc::RpcBscBroadcaster::new(false);
+        assert!(!dry_bsc.broadcast_enabled, "Dry run BSC broadcaster must have broadcast_enabled = false");
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
