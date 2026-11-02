@@ -160,6 +160,15 @@ impl TxLifecycleStatus {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ApprovedPrevout {
+    pub txid: String,
+    pub vout: u32,
+    pub value_satoshis: u64,
+    pub script_pubkey_hex: String,
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,11 +176,12 @@ pub struct TxLifecycleRecord {
     pub record_id: String,
     pub network: BroadcastNetwork,
     pub tx_hash: Option<String>,
+    pub expected_tx_hash: Option<String>,
     pub raw_tx_hex: Option<String>,
     pub payload_hash: Option<String>,
     pub expected_txid: Option<String>,
     pub expected_wtxid: Option<String>,
-    pub expected_input_values: Option<Vec<u64>>,
+    pub approved_prevouts: Option<Vec<ApprovedPrevout>>,
     pub expected_sender: Option<String>,
     pub expected_recipient: Option<String>,
     pub expected_amount_raw: Option<String>,
@@ -191,11 +201,12 @@ impl TxLifecycleRecord {
             record_id: draft_id.clone(),
             network,
             tx_hash: None,
+            expected_tx_hash: None,
             raw_tx_hex: None,
             payload_hash: None,
             expected_txid: None,
             expected_wtxid: None,
-            expected_input_values: None,
+            approved_prevouts: None,
             expected_sender: None,
             expected_recipient: None,
             expected_amount_raw: None,

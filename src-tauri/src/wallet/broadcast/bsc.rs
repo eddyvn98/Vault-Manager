@@ -112,12 +112,12 @@ pub trait BscBroadcaster: Send + Sync {
     fn broadcast_verified(
         &self,
         raw_signed_hex: &str,
-        expected_sender: Option<&str>,
-        expected_recipient: Option<&str>,
-        expected_amount_raw: Option<&str>,
-        expected_nonce: Option<u64>,
-        expected_gas_limit: Option<u64>,
-        expected_gas_price: Option<&str>,
+        expected_sender: &str,
+        expected_recipient: &str,
+        expected_amount_raw: &str,
+        expected_nonce: u64,
+        expected_gas_limit: u64,
+        expected_gas_price: &str,
         network: BroadcastNetwork,
     ) -> Result<String, BscBroadcastError>;
     fn query_receipt(&self, tx_hash: &str, network: BroadcastNetwork) -> Result<BscReceiptStatus, BscBroadcastError>;
@@ -188,12 +188,12 @@ impl BscBroadcaster for MockBscBroadcaster {
     fn broadcast_verified(
         &self,
         raw_signed_hex: &str,
-        _expected_sender: Option<&str>,
-        _expected_recipient: Option<&str>,
-        _expected_amount_raw: Option<&str>,
-        _expected_nonce: Option<u64>,
-        _expected_gas_limit: Option<u64>,
-        _expected_gas_price: Option<&str>,
+        _expected_sender: &str,
+        _expected_recipient: &str,
+        _expected_amount_raw: &str,
+        _expected_nonce: u64,
+        _expected_gas_limit: u64,
+        _expected_gas_price: &str,
         network: BroadcastNetwork,
     ) -> Result<String, BscBroadcastError> {
         self.broadcast(raw_signed_hex, network)
@@ -720,22 +720,22 @@ impl BscBroadcaster for RpcBscBroadcaster {
     fn broadcast_verified(
         &self,
         raw_signed_hex: &str,
-        expected_sender: Option<&str>,
-        expected_recipient: Option<&str>,
-        expected_amount_raw: Option<&str>,
-        expected_nonce: Option<u64>,
-        expected_gas_limit: Option<u64>,
-        expected_gas_price: Option<&str>,
+        expected_sender: &str,
+        expected_recipient: &str,
+        expected_amount_raw: &str,
+        expected_nonce: u64,
+        expected_gas_limit: u64,
+        expected_gas_price: &str,
         network: BroadcastNetwork,
     ) -> Result<String, BscBroadcastError> {
         let computed_hash = self.dry_run_verify_against_draft(
             raw_signed_hex,
-            expected_sender,
-            expected_recipient,
-            expected_amount_raw,
-            expected_nonce,
-            expected_gas_limit,
-            expected_gas_price,
+            Some(expected_sender),
+            Some(expected_recipient),
+            Some(expected_amount_raw),
+            Some(expected_nonce),
+            Some(expected_gas_limit),
+            Some(expected_gas_price),
             network,
         )?;
 

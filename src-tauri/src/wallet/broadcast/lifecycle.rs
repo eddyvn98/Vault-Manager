@@ -162,7 +162,7 @@ impl TxLifecycleCoordinator {
         raw_tx_hex: &str,
         txid: &str,
         wtxid: &str,
-        input_values: Option<Vec<u64>>,
+        approved_prevouts: Vec<crate::wallet::broadcast::types::ApprovedPrevout>,
         now_unix: u64,
     ) -> Result<(), String> {
         {
@@ -172,7 +172,7 @@ impl TxLifecycleCoordinator {
                 .ok_or_else(|| format!("Draft '{}' not found", draft_id))?;
             record.expected_txid = Some(txid.to_string());
             record.expected_wtxid = Some(wtxid.to_string());
-            record.expected_input_values = input_values;
+            record.approved_prevouts = Some(approved_prevouts);
         }
         let signed_status = TxLifecycleStatus::Signed {
             draft_id: draft_id.to_string(),
@@ -190,11 +190,20 @@ impl TxLifecycleCoordinator {
         sender: &str,
         recipient: &str,
         amount_raw: &str,
-        nonce: Option<u64>,
-        gas_limit: Option<u64>,
-        gas_price: Option<String>,
+        nonce: u64,
+        gas_limit: u64,
+        gas_price: &str,
         now_unix: u64,
     ) -> Result<(), String> {
+        let clean = raw_tx_hex.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let raw_bytes = hex::decode(clean).map_err(|e| format!("Invalid raw EVM hex: {}", e))?;
+        let mut hasher = tiny_keccak::Keccak::v256();
+        let mut hash = [0u8; 32];
+        use tiny_keccak::Hasher;
+        hasher.update(&raw_bytes);
+        hasher.finalize(&mut hash);
+        let computed_hash = format!("0x{}", hex::encode(hash));
+
         {
             let record = self
                 .records
@@ -203,9 +212,11 @@ impl TxLifecycleCoordinator {
             record.expected_sender = Some(sender.to_string());
             record.expected_recipient = Some(recipient.to_string());
             record.expected_amount_raw = Some(amount_raw.to_string());
-            record.expected_nonce = nonce;
-            record.expected_gas_limit = gas_limit;
-            record.expected_gas_price = gas_price;
+            record.expected_nonce = Some(nonce);
+            record.expected_gas_limit = Some(gas_limit);
+            record.expected_gas_price = Some(gas_price.to_string());
+            record.expected_tx_hash = Some(computed_hash.clone());
+            record.tx_hash = Some(computed_hash);
         }
         let signed_status = TxLifecycleStatus::Signed {
             draft_id: draft_id.to_string(),
@@ -227,7 +238,7 @@ impl TxLifecycleCoordinator {
             return Err("Mandatory storage path is not configured on TxLifecycleCoordinator".to_string());
         }
 
-        let (raw_hex, expected_txid, expected_wtxid, expected_input_values, network) = {
+        let (raw_hex, expected_txid, expected_wtxid, approved_prevouts, network) = {
             let record = self
                 .records
                 .get(draft_id)
@@ -243,7 +254,12 @@ impl TxLifecycleCoordinator {
             let expected_wtxid = record.expected_wtxid.as_ref().ok_or_else(|| {
                 "Mandatory draft verification failure: missing approved expected_wtxid".to_string()
             })?.clone();
-            let expected_input_values = record.expected_input_values.clone();
+            let approved_prevouts = record.approved_prevouts.as_ref().ok_or_else(|| {
+                "Mandatory draft verification failure: missing approved_prevouts (zero fallback)".to_string()
+            })?.clone();
+            if approved_prevouts.is_empty() {
+                return Err("Mandatory draft verification failure: approved_prevouts cannot be empty".to_string());
+            }
 
             let raw = match &record.status {
                 TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
@@ -260,7 +276,7 @@ impl TxLifecycleCoordinator {
                     ))
                 }
             };
-            (raw, expected_txid, expected_wtxid, expected_input_values, record.network)
+            (raw, expected_txid, expected_wtxid, approved_prevouts, record.network)
         };
 
         let mut attempt = 0u32;
@@ -277,7 +293,7 @@ impl TxLifecycleCoordinator {
                 &raw_hex,
                 &expected_txid,
                 &expected_wtxid,
-                expected_input_values.as_deref(),
+                &approved_prevouts,
                 network,
             );
 
@@ -345,6 +361,15 @@ impl TxLifecycleCoordinator {
             let expected_amount_raw = record.expected_amount_raw.as_ref().ok_or_else(|| {
                 "Mandatory draft verification failure: missing approved expected_amount_raw".to_string()
             })?.clone();
+            let expected_nonce = record.expected_nonce.ok_or_else(|| {
+                "Mandatory draft verification failure: missing approved expected_nonce".to_string()
+            })?;
+            let expected_gas_limit = record.expected_gas_limit.ok_or_else(|| {
+                "Mandatory draft verification failure: missing approved expected_gas_limit".to_string()
+            })?;
+            let expected_gas_price = record.expected_gas_price.as_ref().ok_or_else(|| {
+                "Mandatory draft verification failure: missing approved expected_gas_price".to_string()
+            })?.clone();
 
             let raw = match &record.status {
                 TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
@@ -366,9 +391,9 @@ impl TxLifecycleCoordinator {
                 expected_sender,
                 expected_recipient,
                 expected_amount_raw,
-                record.expected_nonce,
-                record.expected_gas_limit,
-                record.expected_gas_price.clone(),
+                expected_nonce,
+                expected_gas_limit,
+                expected_gas_price,
                 record.network,
             )
         };
@@ -385,12 +410,12 @@ impl TxLifecycleCoordinator {
 
             let broadcast_res = broadcaster.broadcast_verified(
                 &raw_hex,
-                Some(&expected_sender),
-                Some(&expected_recipient),
-                Some(&expected_amount_raw),
+                &expected_sender,
+                &expected_recipient,
+                &expected_amount_raw,
                 expected_nonce,
                 expected_gas_limit,
-                expected_gas_price.as_deref(),
+                &expected_gas_price,
                 network,
             );
 
@@ -562,6 +587,7 @@ impl TxLifecycleCoordinator {
                 record
                     .tx_hash
                     .clone()
+                    .or_else(|| record.expected_tx_hash.clone())
                     .ok_or_else(|| "Cannot poll BSC lifecycle: missing tx_hash in record".to_string())?
             }
             other => {

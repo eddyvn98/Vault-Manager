@@ -90,7 +90,7 @@ pub trait BtcBroadcaster: Send + Sync {
         raw_tx_hex: &str,
         expected_txid: &str,
         expected_wtxid: &str,
-        expected_input_values: Option<&[u64]>,
+        expected_prevouts: &[crate::wallet::broadcast::types::ApprovedPrevout],
         network: BroadcastNetwork,
     ) -> Result<String, BtcBroadcastError>;
     fn query_status(&self, txid: &str, network: BroadcastNetwork) -> Result<BtcTxQueryStatus, BtcBroadcastError>;
@@ -162,7 +162,7 @@ impl BtcBroadcaster for MockBtcBroadcaster {
         raw_tx_hex: &str,
         _expected_txid: &str,
         _expected_wtxid: &str,
-        _expected_input_values: Option<&[u64]>,
+        _expected_prevouts: &[crate::wallet::broadcast::types::ApprovedPrevout],
         network: BroadcastNetwork,
     ) -> Result<String, BtcBroadcastError> {
         self.broadcast(raw_tx_hex, network)
@@ -282,19 +282,40 @@ impl EsploraBtcBroadcaster {
         Ok((tx, computed_txid, computed_wtxid))
     }
 
-    /// Cryptographically verifies ECDSA DER signatures against compressed pubkeys and BIP-143 sighash
-    pub fn verify_input_signatures(&self, tx: &bitcoin::Transaction, prev_values: &[u64]) -> Result<(), BtcBroadcastError> {
-        if prev_values.len() != tx.input.len() {
+    /// Cryptographically verifies ECDSA DER signatures against compressed pubkeys and BIP-143 sighash,
+    /// and enforces exact match of prevout outpoints, values, and script_pubkeys.
+    pub fn verify_input_signatures(
+        &self,
+        tx: &bitcoin::Transaction,
+        prevouts: &[crate::wallet::broadcast::types::ApprovedPrevout],
+    ) -> Result<(), BtcBroadcastError> {
+        if prevouts.is_empty() {
+            return Err(BtcBroadcastError::NodeRejected(
+                "Mandatory verification failure: approved_prevouts cannot be empty".to_string(),
+            ));
+        }
+        if prevouts.len() != tx.input.len() {
             return Err(BtcBroadcastError::NodeRejected(format!(
-                "Approved input values count ({}) does not match transaction input count ({})",
-                prev_values.len(), tx.input.len()
+                "Approved prevouts count ({}) does not match transaction input count ({})",
+                prevouts.len(),
+                tx.input.len()
             )));
         }
 
         let mut sighash_cache = bitcoin::sighash::SighashCache::new(tx);
         let secp = secp256k1::Secp256k1::verification_only();
 
-        for (i, &val) in prev_values.iter().enumerate() {
+        for (i, prevout) in prevouts.iter().enumerate() {
+            // 1. Strict Outpoint binding: verify input txid and vout match approved prevout
+            let input_txid = tx.input[i].previous_output.txid.to_string();
+            let input_vout = tx.input[i].previous_output.vout;
+            if input_txid != prevout.txid || input_vout != prevout.vout {
+                return Err(BtcBroadcastError::NodeRejected(format!(
+                    "Input {} outpoint '{}:{}' does not match approved prevout '{}:{}'",
+                    i, input_txid, input_vout, prevout.txid, prevout.vout
+                )));
+            }
+
             let witness = &tx.input[i].witness;
             let sig_bytes = witness.nth(0).ok_or_else(|| {
                 BtcBroadcastError::NodeRejected(format!("Input {} missing signature witness", i))
@@ -307,16 +328,29 @@ impl EsploraBtcBroadcaster {
                 BtcBroadcastError::NodeRejected(format!("Input {} invalid pubkey: {}", i, e))
             })?;
 
+            // 2. Strict ScriptPubkey binding: verify pubkey derives to approved prevout script_pubkey
+            let expected_script_bytes = hex::decode(prevout.script_pubkey_hex.trim_start_matches("0x"))
+                .map_err(|e| BtcBroadcastError::NodeRejected(format!("Invalid prevout script_pubkey hex: {}", e)))?;
+            let expected_script = bitcoin::ScriptBuf::from_bytes(expected_script_bytes);
+            let derived_script = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::hash(pubkey_bytes));
+            if derived_script != expected_script {
+                return Err(BtcBroadcastError::NodeRejected(format!(
+                    "Input {} witness pubkey script '{}' does not match approved prevout script_pubkey '{}'",
+                    i, derived_script.to_hex_string(), prevout.script_pubkey_hex
+                )));
+            }
+
+            // 3. Strict DER Signature parsing
             let der_bytes = &sig_bytes[..sig_bytes.len() - 1];
             let sig = secp256k1::ecdsa::Signature::from_der(der_bytes).map_err(|e| {
                 BtcBroadcastError::NodeRejected(format!("Input {} invalid DER signature: {}", i, e))
             })?;
 
-            let script_code = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::hash(pubkey_bytes));
+            // 4. BIP-143 Sighash Calculation with approved satoshis
             let sighash = sighash_cache.p2wpkh_signature_hash(
                 i,
-                &script_code,
-                bitcoin::Amount::from_sat(val),
+                &expected_script,
+                bitcoin::Amount::from_sat(prevout.value_satoshis),
                 bitcoin::sighash::EcdsaSighashType::All,
             ).map_err(|e| BtcBroadcastError::NodeRejected(format!("Failed to calculate BIP-143 sighash for input {}: {}", i, e)))?;
 
@@ -329,13 +363,14 @@ impl EsploraBtcBroadcaster {
         Ok(())
     }
 
-    /// Verifies that the raw transaction txid AND wtxid strictly match the approved draft before broadcasting
+    /// Verifies that the raw transaction txid AND wtxid strictly match the approved draft,
+    /// and cryptographically verifies ECDSA signatures against approved prevouts before broadcasting (Zero Fallback).
     pub fn broadcast_verified(
         &self,
         raw_tx_hex: &str,
         expected_txid: &str,
         expected_wtxid: &str,
-        expected_input_values: Option<&[u64]>,
+        expected_prevouts: &[crate::wallet::broadcast::types::ApprovedPrevout],
         network: BroadcastNetwork,
     ) -> Result<String, BtcBroadcastError> {
         let (tx, computed_txid, computed_wtxid) = self.dry_run_verify(raw_tx_hex, network)?;
@@ -351,9 +386,8 @@ impl EsploraBtcBroadcaster {
                 computed_wtxid, expected_wtxid
             )));
         }
-        if let Some(values) = expected_input_values {
-            self.verify_input_signatures(&tx, values)?;
-        }
+        // MANDATORY: Always verify cryptographic signatures against approved prevouts
+        self.verify_input_signatures(&tx, expected_prevouts)?;
         self.broadcast(raw_tx_hex, network)
     }
 }
@@ -403,10 +437,10 @@ impl BtcBroadcaster for EsploraBtcBroadcaster {
         raw_tx_hex: &str,
         expected_txid: &str,
         expected_wtxid: &str,
-        expected_input_values: Option<&[u64]>,
+        expected_prevouts: &[crate::wallet::broadcast::types::ApprovedPrevout],
         network: BroadcastNetwork,
     ) -> Result<String, BtcBroadcastError> {
-        self.broadcast_verified(raw_tx_hex, expected_txid, expected_wtxid, expected_input_values, network)
+        self.broadcast_verified(raw_tx_hex, expected_txid, expected_wtxid, expected_prevouts, network)
     }
 
     fn query_status(&self, txid: &str, network: BroadcastNetwork) -> Result<BtcTxQueryStatus, BtcBroadcastError> {

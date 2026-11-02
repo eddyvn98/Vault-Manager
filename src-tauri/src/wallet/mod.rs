@@ -221,12 +221,13 @@ pub struct VerifiedSignedBtcDraft {
     pub payload_hash: String,
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 struct SqliteState {
     active_connections: usize,
     is_locked_for_reset: bool,
 }
 
+#[derive(Debug)]
 pub struct SqliteTracker {
     state: Mutex<SqliteState>,
 }
@@ -247,6 +248,19 @@ impl Drop for SqliteConnGuard {
     fn drop(&mut self) {
         if let Ok(mut state) = self.tracker.state.lock() {
             state.active_connections = state.active_connections.saturating_sub(1);
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SqliteResetPermit {
+    tracker: std::sync::Arc<SqliteTracker>,
+}
+
+impl Drop for SqliteResetPermit {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.tracker.state.lock() {
+            state.is_locked_for_reset = false;
         }
     }
 }
@@ -273,14 +287,20 @@ impl SqliteTracker {
         })
     }
 
-    /// Atomically locks the tracker against new connections and confirms active_connections is strictly 0
-    pub fn begin_reset(&self) -> Result<(), String> {
-        // Step 1: Immediately lock out new connection attempts
+    /// Atomically claims exclusive reset ownership with RAII SqliteResetPermit.
+    /// Fails immediately if another reset is already in progress.
+    pub fn begin_reset(self: &std::sync::Arc<Self>) -> Result<SqliteResetPermit, String> {
+        // Step 1: Claim exclusive reset ownership
         {
             let mut state = self.state.lock().map_err(|_| "SQLite tracker lock poisoned".to_string())?;
+            if state.is_locked_for_reset {
+                return Err("Another reset/purge operation is already in progress".to_string());
+            }
             state.is_locked_for_reset = true;
             if state.active_connections == 0 {
-                return Ok(());
+                return Ok(SqliteResetPermit {
+                    tracker: std::sync::Arc::clone(self),
+                });
             }
         }
 
@@ -289,26 +309,24 @@ impl SqliteTracker {
             std::thread::sleep(std::time::Duration::from_millis(10));
             let state = self.state.lock().map_err(|_| "SQLite tracker lock poisoned".to_string())?;
             if state.active_connections == 0 {
-                return Ok(());
+                return Ok(SqliteResetPermit {
+                    tracker: std::sync::Arc::clone(self),
+                });
             }
         }
 
         // Step 3: If active connections still remain, rollback the lock and fail safely
         let mut state = self.state.lock().map_err(|_| "SQLite tracker lock poisoned".to_string())?;
         if state.active_connections == 0 {
-            Ok(())
+            Ok(SqliteResetPermit {
+                tracker: std::sync::Arc::clone(self),
+            })
         } else {
             state.is_locked_for_reset = false;
             Err(format!(
                 "Cannot reset wallet: {} active SQLite database connection(s) still open. Reset aborted safely.",
                 state.active_connections
             ))
-        }
-    }
-
-    pub fn finish_reset(&self) {
-        if let Ok(mut state) = self.state.lock() {
-            state.is_locked_for_reset = false;
         }
     }
 }
@@ -884,27 +902,18 @@ pub fn reset_wallet(
     }
 
     // 2. Coordinate SQLite shutdown: lock new connections and ensure active connections are closed
-    state.sqlite_tracker.begin_reset()?;
+    let _reset_permit = state.sqlite_tracker.begin_reset()?;
 
     // 3. Clean up SQLite database and journals FIRST (fail-closed if app_dir unresolvable)
     let app_dir = app
         .path()
         .app_data_dir()
-        .map_err(|e| {
-            state.sqlite_tracker.finish_reset();
-            format!("Cannot resolve application data directory for SQLite cleanup: {}", e)
-        })?;
+        .map_err(|e| format!("Cannot resolve application data directory for SQLite cleanup: {}", e))?;
 
-    if let Err(e) = cleanup_sqlite_files(&app_dir) {
-        state.sqlite_tracker.finish_reset();
-        return Err(e);
-    }
+    cleanup_sqlite_files(&app_dir)?;
 
     // 4. Only after SQLite cleanup succeeds, remove the vault file
-    let rm_vault_res = fs::remove_file(&file);
-    state.sqlite_tracker.finish_reset();
-
-    rm_vault_res.map_err(|e| format!("Cannot remove vault file: {}", e))?;
+    fs::remove_file(&file).map_err(|e| format!("Cannot remove vault file: {}", e))?;
     mgr.record_success();
 
     Ok(())
