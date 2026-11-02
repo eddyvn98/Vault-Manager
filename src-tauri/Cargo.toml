@@ -25,7 +25,12 @@ base64 = "0.22"
 zeroize = "1.8"
 bitcoin = { version = "0.32", default-features = false, features = ["std", "rand-std"] }
 bdk_wallet = { version = "3.2.0", default-features = false, features = ["std"] }
+bdk_esplora = { version = "0.22.3", default-features = false, features = ["std", "async-https-rustls", "tokio"] }
 tiny-keccak = { version = "2.0", features = ["keccak"] }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 num-bigint = "0.4"
 num-traits = "0.2"
+hex = "0.4"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

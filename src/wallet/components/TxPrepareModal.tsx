@@ -30,21 +30,46 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
 
     try {
       if (network === 'btc') {
-        const sats = parseInt(amount, 10);
-        if (isNaN(sats) || sats <= 0) {
-          throw new Error('Please enter a valid satoshi amount integer');
+        const cleanAmount = amount.trim();
+        if (!/^\d+$/.test(cleanAmount)) {
+          throw new Error('Please enter a valid whole satoshi amount integer (digits only)');
         }
-        const rate = parseInt(feeRate, 10) || 2;
+        const satsBig = BigInt(cleanAmount);
+        if (satsBig <= 0n) {
+          throw new Error('Satoshi amount must be greater than zero');
+        }
+        if (satsBig > 21_000_000n * 100_000_000n) {
+          throw new Error('Amount exceeds maximum Bitcoin supply (21M BTC)');
+        }
+        const satsNum = Number(satsBig);
+        if (!Number.isSafeInteger(satsNum)) {
+          throw new Error('Amount exceeds JavaScript safe integer limit');
+        }
+
+        const cleanRate = feeRate.trim() || '2';
+        if (!/^\d+$/.test(cleanRate)) {
+          throw new Error('Fee rate must be a valid whole number (sat/vB)');
+        }
+        const rateNum = Number(cleanRate);
+        if (rateNum <= 0 || rateNum > 1000) {
+          throw new Error('Fee rate must be between 1 and 1000 sat/vB');
+        }
+
         const res = await invoke<BtcTxPreview>('prepare_btc_transaction', {
-          recipient,
-          amountSatoshis: sats,
-          feeRateSatVb: rate,
+          recipient: recipient.trim(),
+          amountSatoshis: satsNum,
+          feeRateSatVb: rateNum,
         });
         setBtcPreview(res);
       } else {
+        const cleanRecipient = recipient.trim();
+        const cleanAmount = amount.trim();
+        if (!cleanAmount) {
+          throw new Error('Please enter a token amount');
+        }
         const res = await invoke<BscTxPreview>('prepare_bsc_transaction', {
-          recipient,
-          amountTokens: amount,
+          recipient: cleanRecipient,
+          amountTokens: cleanAmount,
         });
         setBscPreview(res);
       }

@@ -24,6 +24,7 @@ pub struct SessionState {
     pub last_activity: Option<Instant>,
     pub pending_creation: Option<Zeroizing<String>>,
     pub active_draft_id: Option<String>,
+    pub session_epoch: u64,
 }
 
 pub struct WalletSession {
@@ -92,6 +93,8 @@ fn check_and_apply_auto_lock(session: &mut SessionState) -> bool {
         if last.elapsed() > Duration::from_secs(SESSION_TIMEOUT_SECS) {
             session.mnemonic = None;
             session.last_activity = None;
+            session.active_draft_id = None;
+            session.session_epoch = session.session_epoch.wrapping_add(1);
             return false;
         }
         return true;
@@ -161,6 +164,8 @@ pub fn finalize_wallet_creation(
     session.pending_creation = None;
     session.mnemonic = None;
     session.last_activity = None;
+    session.active_draft_id = None;
+    session.session_epoch = session.session_epoch.wrapping_add(1);
 
     lockout_manager(&app)?.record_success();
     Ok(())
@@ -185,6 +190,8 @@ pub fn restore_wallet(
     session.pending_creation = None;
     session.mnemonic = None;
     session.last_activity = None;
+    session.active_draft_id = None;
+    session.session_epoch = session.session_epoch.wrapping_add(1);
 
     lockout_manager(&app)?.record_success();
     Ok(())
@@ -219,6 +226,8 @@ pub fn unlock_wallet(
     let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
     session.mnemonic = Some(recovery);
     session.last_activity = Some(Instant::now());
+    session.active_draft_id = None;
+    session.session_epoch = session.session_epoch.wrapping_add(1);
     Ok(())
 }
 
@@ -228,6 +237,7 @@ pub fn lock_wallet(state: State<'_, WalletSession>) -> Result<(), String> {
     session.mnemonic = None;
     session.last_activity = None;
     session.active_draft_id = None;
+    session.session_epoch = session.session_epoch.wrapping_add(1);
     Ok(())
 }
 
@@ -349,7 +359,7 @@ pub async fn prepare_btc_transaction(
     amount_satoshis: u64,
     fee_rate_sat_vb: Option<u64>,
 ) -> Result<tx::BtcTxPreview, String> {
-    let mnemonic = {
+    let (mnemonic, initial_epoch) = {
         let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
         if !check_and_apply_auto_lock(&mut session) {
             return Err("Wallet is locked".into());
@@ -358,16 +368,24 @@ pub async fn prepare_btc_transaction(
             .mnemonic
             .as_ref()
             .ok_or_else(|| "Wallet is locked".to_string())?;
-        m.clone()
+        (m.clone(), session.session_epoch)
     };
 
     let preview =
         tx::btc::prepare::prepare_signet_tx(&mnemonic, &recipient, amount_satoshis, fee_rate_sat_vb)
             .await?;
 
-    if let Ok(mut session) = state.session.lock() {
-        session.active_draft_id = Some(preview.draft_id.clone());
+    let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+    if !check_and_apply_auto_lock(&mut session)
+        || session.session_epoch != initial_epoch
+        || session.mnemonic.is_none()
+    {
+        session.active_draft_id = None;
+        return Err("Wallet was locked, reset, or session expired during transaction preparation. Draft invalidated.".into());
     }
+
+    session.active_draft_id = Some(preview.draft_id.clone());
+    session.last_activity = Some(Instant::now());
 
     Ok(preview)
 }
@@ -378,7 +396,7 @@ pub async fn prepare_bsc_transaction(
     recipient: String,
     amount_tokens: String,
 ) -> Result<tx::BscTxPreview, String> {
-    let mnemonic = {
+    let (mnemonic, initial_epoch) = {
         let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
         if !check_and_apply_auto_lock(&mut session) {
             return Err("Wallet is locked".into());
@@ -387,15 +405,23 @@ pub async fn prepare_bsc_transaction(
             .mnemonic
             .as_ref()
             .ok_or_else(|| "Wallet is locked".to_string())?;
-        m.clone()
+        (m.clone(), session.session_epoch)
     };
 
     let preview =
         tx::bsc::prepare::prepare_bsc_testnet_tx(&mnemonic, &recipient, &amount_tokens).await?;
 
-    if let Ok(mut session) = state.session.lock() {
-        session.active_draft_id = Some(preview.draft_id.clone());
+    let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+    if !check_and_apply_auto_lock(&mut session)
+        || session.session_epoch != initial_epoch
+        || session.mnemonic.is_none()
+    {
+        session.active_draft_id = None;
+        return Err("Wallet was locked, reset, or session expired during transaction preparation. Draft invalidated.".into());
     }
+
+    session.active_draft_id = Some(preview.draft_id.clone());
+    session.last_activity = Some(Instant::now());
 
     Ok(preview)
 }
@@ -428,6 +454,8 @@ pub fn reset_wallet(
     session.mnemonic = None;
     session.last_activity = None;
     session.pending_creation = None;
+    session.active_draft_id = None;
+    session.session_epoch = session.session_epoch.wrapping_add(1);
     Ok(())
 }
 
@@ -472,5 +500,21 @@ mod tests {
 
         assert_ne!(&*phrase, &*wrong_phrase);
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn session_epoch_increments_and_invalidates_drafts() {
+        let mut session = SessionState::default();
+        let epoch0 = session.session_epoch;
+
+        // Auto-lock on timeout increments epoch and clears active_draft_id
+        session.mnemonic = Some(Zeroizing::new("test-mnemonic".to_string()));
+        session.last_activity = Some(Instant::now() - Duration::from_secs(SESSION_TIMEOUT_SECS + 1));
+        session.active_draft_id = Some("draft-btc-123".into());
+
+        assert!(!check_and_apply_auto_lock(&mut session));
+        assert_eq!(session.session_epoch, epoch0 + 1);
+        assert!(session.active_draft_id.is_none());
+        assert!(session.mnemonic.is_none());
     }
 }

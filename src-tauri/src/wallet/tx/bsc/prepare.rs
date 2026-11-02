@@ -1,6 +1,7 @@
 use std::time::Duration;
 use num_bigint::BigUint;
 use num_traits::Num;
+use rand::RngCore;
 use reqwest::Client;
 use crate::wallet::{
     bip,
@@ -94,7 +95,9 @@ pub async fn prepare_bsc_testnet_tx(
     let raw_hex = format!("0x{:x}", amount_wei);
     let formatted_amount = blockchain::format_wei_18(&raw_hex)?;
 
-    let draft_id = format!("draft-bsc-{}-{}", gas_info.nonce, &calldata_hex[10..18]);
+    let mut rand_bytes = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut rand_bytes);
+    let draft_id = format!("draft-bsc-{}", hex::encode(rand_bytes));
 
     let unsigned_summary = format!(
         "EVM Tx [ChainId: {}, From: {}, To Contract: {}, Nonce: {}, GasLimit: {}, GasPrice: {} Gwei, Data: {}]",
