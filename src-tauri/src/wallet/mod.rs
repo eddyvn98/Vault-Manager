@@ -221,16 +221,20 @@ pub struct VerifiedSignedBtcDraft {
     pub payload_hash: String,
 }
 
+#[derive(Default)]
+struct SqliteState {
+    active_connections: usize,
+    is_locked_for_reset: bool,
+}
+
 pub struct SqliteTracker {
-    pub active_connections: std::sync::atomic::AtomicUsize,
-    pub is_locked_for_reset: std::sync::atomic::AtomicBool,
+    state: Mutex<SqliteState>,
 }
 
 impl Default for SqliteTracker {
     fn default() -> Self {
         Self {
-            active_connections: std::sync::atomic::AtomicUsize::new(0),
-            is_locked_for_reset: std::sync::atomic::AtomicBool::new(false),
+            state: Mutex::new(SqliteState::default()),
         }
     }
 }
@@ -241,46 +245,71 @@ pub struct SqliteConnGuard {
 
 impl Drop for SqliteConnGuard {
     fn drop(&mut self) {
-        self.tracker.active_connections.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut state) = self.tracker.state.lock() {
+            state.active_connections = state.active_connections.saturating_sub(1);
+        }
     }
 }
 
+#[allow(dead_code)]
 impl SqliteTracker {
+    pub fn active_connections(&self) -> usize {
+        self.state.lock().map(|s| s.active_connections).unwrap_or(0)
+    }
+
+    pub fn is_locked(&self) -> bool {
+        self.state.lock().map(|s| s.is_locked_for_reset).unwrap_or(true)
+    }
+
+    /// Atomically verifies reset flag and increments active_connections in a single critical section
     pub fn acquire_connection(self: &std::sync::Arc<Self>) -> Result<SqliteConnGuard, String> {
-        if self.is_locked_for_reset.load(std::sync::atomic::Ordering::SeqCst) {
+        let mut state = self.state.lock().map_err(|_| "SQLite tracker lock poisoned".to_string())?;
+        if state.is_locked_for_reset {
             return Err("SQLite database access denied: reset/purge operation is in progress".to_string());
         }
-        self.active_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        state.active_connections += 1;
         Ok(SqliteConnGuard {
             tracker: std::sync::Arc::clone(self),
         })
     }
 
+    /// Atomically locks the tracker against new connections and confirms active_connections is strictly 0
     pub fn begin_reset(&self) -> Result<(), String> {
-        self.is_locked_for_reset.store(true, std::sync::atomic::Ordering::SeqCst);
-
-        // Give in-flight queries a short graceful window (100ms) to drop
-        for _ in 0..10 {
-            if self.active_connections.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        // Step 1: Immediately lock out new connection attempts
+        {
+            let mut state = self.state.lock().map_err(|_| "SQLite tracker lock poisoned".to_string())?;
+            state.is_locked_for_reset = true;
+            if state.active_connections == 0 {
                 return Ok(());
             }
+        }
+
+        // Step 2: Grace period (up to 150ms) for in-flight active queries to finish and drop their guards
+        for _ in 0..15 {
             std::thread::sleep(std::time::Duration::from_millis(10));
+            let state = self.state.lock().map_err(|_| "SQLite tracker lock poisoned".to_string())?;
+            if state.active_connections == 0 {
+                return Ok(());
+            }
         }
 
-        let active = self.active_connections.load(std::sync::atomic::Ordering::SeqCst);
-        if active > 0 {
-            self.is_locked_for_reset.store(false, std::sync::atomic::Ordering::SeqCst);
-            return Err(format!(
+        // Step 3: If active connections still remain, rollback the lock and fail safely
+        let mut state = self.state.lock().map_err(|_| "SQLite tracker lock poisoned".to_string())?;
+        if state.active_connections == 0 {
+            Ok(())
+        } else {
+            state.is_locked_for_reset = false;
+            Err(format!(
                 "Cannot reset wallet: {} active SQLite database connection(s) still open. Reset aborted safely.",
-                active
-            ));
+                state.active_connections
+            ))
         }
-
-        Ok(())
     }
 
     pub fn finish_reset(&self) {
-        self.is_locked_for_reset.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut state) = self.state.lock() {
+            state.is_locked_for_reset = false;
+        }
     }
 }
 
@@ -857,14 +886,16 @@ pub fn reset_wallet(
     // 2. Coordinate SQLite shutdown: lock new connections and ensure active connections are closed
     state.sqlite_tracker.begin_reset()?;
 
-    // 3. Clean up SQLite database and journals FIRST
-    let cleanup_res = if let Ok(app_dir) = app.path().app_data_dir() {
-        cleanup_sqlite_files(&app_dir)
-    } else {
-        Ok(())
-    };
+    // 3. Clean up SQLite database and journals FIRST (fail-closed if app_dir unresolvable)
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| {
+            state.sqlite_tracker.finish_reset();
+            format!("Cannot resolve application data directory for SQLite cleanup: {}", e)
+        })?;
 
-    if let Err(e) = cleanup_res {
+    if let Err(e) = cleanup_sqlite_files(&app_dir) {
         state.sqlite_tracker.finish_reset();
         return Err(e);
     }

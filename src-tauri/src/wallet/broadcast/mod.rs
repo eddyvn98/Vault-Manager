@@ -35,7 +35,9 @@ mod tests {
 
     #[test]
     fn test_btc_lifecycle_happy_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(temp_dir.path().join("happy_path.json"));
         let broadcaster = MockBtcBroadcaster::new();
 
         let draft_id = "draft_btc_01";
@@ -44,7 +46,7 @@ mod tests {
             .unwrap();
 
         coordinator
-            .record_signed(draft_id, "mock_hash", "02000000000101deadbeef", 1005)
+            .record_signed_btc(draft_id, "mock_hash", "02000000000101deadbeef", "mock_txid", "mock_wtxid", None, 1005)
             .unwrap();
 
         let txid = coordinator
@@ -81,7 +83,9 @@ mod tests {
 
     #[test]
     fn test_btc_broadcast_double_spend_rejection() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(temp_dir.path().join("ds.json"));
         let broadcaster = MockBtcBroadcaster::new();
 
         let draft_id = "draft_btc_double_spend";
@@ -89,7 +93,7 @@ mod tests {
             .register_draft(draft_id, BroadcastNetwork::BitcoinSignet, 1000)
             .unwrap();
         coordinator
-            .record_signed(draft_id, "mock_hash", "02000000000101badinputs", 1005)
+            .record_signed_btc(draft_id, "mock_hash", "02000000000101badinputs", "mock_txid", "mock_wtxid", None, 1005)
             .unwrap();
 
         // Configure broadcaster to reject with DoubleSpend
@@ -115,7 +119,9 @@ mod tests {
 
     #[test]
     fn test_btc_broadcast_timeout_retry_then_success() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(temp_dir.path().join("retry.json"));
         let broadcaster = MockBtcBroadcaster::new();
 
         let draft_id = "draft_btc_retry";
@@ -123,7 +129,7 @@ mod tests {
             .register_draft(draft_id, BroadcastNetwork::BitcoinSignet, 1000)
             .unwrap();
         coordinator
-            .record_signed(draft_id, "mock_hash", "02000000000101retrytx", 1005)
+            .record_signed_btc(draft_id, "mock_hash", "02000000000101retrytx", "mock_txid", "mock_wtxid", None, 1005)
             .unwrap();
 
         // First attempt returns Timeout, subsequent succeeds
@@ -143,7 +149,9 @@ mod tests {
 
     #[test]
     fn test_btc_lifecycle_rbf_replacement_detection() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(temp_dir.path().join("rbf.json"));
         let broadcaster = MockBtcBroadcaster::new();
 
         let draft_id = "draft_btc_rbf";
@@ -151,7 +159,7 @@ mod tests {
             .register_draft(draft_id, BroadcastNetwork::BitcoinSignet, 1000)
             .unwrap();
         coordinator
-            .record_signed(draft_id, "mock_hash", "02000000000101rbftx", 1005)
+            .record_signed_btc(draft_id, "mock_hash", "02000000000101rbftx", "mock_txid", "mock_wtxid", None, 1005)
             .unwrap();
 
         let txid = coordinator
@@ -183,7 +191,9 @@ mod tests {
 
     #[test]
     fn test_btc_lifecycle_reorg_detection() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(temp_dir.path().join("reorg.json"));
         let broadcaster = MockBtcBroadcaster::new();
 
         let draft_id = "draft_btc_reorg";
@@ -191,7 +201,7 @@ mod tests {
             .register_draft(draft_id, BroadcastNetwork::BitcoinSignet, 1000)
             .unwrap();
         coordinator
-            .record_signed(draft_id, "mock_hash", "02000000000101reorgtx", 1005)
+            .record_signed_btc(draft_id, "mock_hash", "02000000000101reorgtx", "mock_txid", "mock_wtxid", None, 1005)
             .unwrap();
 
         let txid = coordinator
@@ -235,7 +245,9 @@ mod tests {
 
     #[test]
     fn test_bsc_lifecycle_happy_path() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(temp_dir.path().join("bsc_happy.json"));
         let broadcaster = MockBscBroadcaster::new();
 
         let draft_id = "draft_bsc_01";
@@ -243,7 +255,18 @@ mod tests {
             .register_draft(draft_id, BroadcastNetwork::BscTestnet, 1000)
             .unwrap();
         coordinator
-            .record_signed(draft_id, "mock_hash", "0xf86c018504a817c80082520894...", 1005)
+            .record_signed_bsc(
+                draft_id,
+                "mock_hash",
+                "0xf86c018504a817c80082520894...",
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                "1000",
+                None,
+                None,
+                None,
+                1005,
+            )
             .unwrap();
 
         let tx_hash = coordinator
@@ -277,7 +300,9 @@ mod tests {
 
     #[test]
     fn test_bsc_broadcast_nonce_too_low_conflict() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(temp_dir.path().join("bsc_nonce.json"));
         let broadcaster = MockBscBroadcaster::new();
 
         let draft_id = "draft_bsc_nonce_err";
@@ -285,7 +310,18 @@ mod tests {
             .register_draft(draft_id, BroadcastNetwork::BscTestnet, 1000)
             .unwrap();
         coordinator
-            .record_signed(draft_id, "mock_hash", "0xf86c...", 1005)
+            .record_signed_bsc(
+                draft_id,
+                "mock_hash",
+                "0xf86c...",
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                "1000",
+                None,
+                None,
+                None,
+                1005,
+            )
             .unwrap();
 
         broadcaster.set_next_broadcast_result(Err(BscBroadcastError::NonceTooLow {
@@ -310,7 +346,9 @@ mod tests {
 
     #[test]
     fn test_bsc_broadcast_replacement_underpriced() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(temp_dir.path().join("bsc_underpriced.json"));
         let broadcaster = MockBscBroadcaster::new();
 
         let draft_id = "draft_bsc_underpriced";
@@ -318,7 +356,18 @@ mod tests {
             .register_draft(draft_id, BroadcastNetwork::BscTestnet, 1000)
             .unwrap();
         coordinator
-            .record_signed(draft_id, "mock_hash", "0xf86c...", 1005)
+            .record_signed_bsc(
+                draft_id,
+                "mock_hash",
+                "0xf86c...",
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                "1000",
+                None,
+                None,
+                None,
+                1005,
+            )
             .unwrap();
 
         broadcaster.set_next_broadcast_result(Err(BscBroadcastError::ReplacementUnderpriced {
@@ -336,7 +385,9 @@ mod tests {
 
     #[test]
     fn test_bsc_lifecycle_execution_reverted_status_0x0() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(temp_dir.path().join("bsc_revert.json"));
         let broadcaster = MockBscBroadcaster::new();
 
         let draft_id = "draft_bsc_revert";
@@ -344,7 +395,18 @@ mod tests {
             .register_draft(draft_id, BroadcastNetwork::BscTestnet, 1000)
             .unwrap();
         coordinator
-            .record_signed(draft_id, "mock_hash", "0xf86c...", 1005)
+            .record_signed_bsc(
+                draft_id,
+                "mock_hash",
+                "0xf86c...",
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                "1000",
+                None,
+                None,
+                None,
+                1005,
+            )
             .unwrap();
 
         let tx_hash = coordinator
@@ -375,7 +437,9 @@ mod tests {
 
     #[test]
     fn test_bsc_lifecycle_reorg_detection() {
+        let temp_dir = tempfile::tempdir().unwrap();
         let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(temp_dir.path().join("bsc_reorg.json"));
         let broadcaster = MockBscBroadcaster::new();
 
         let draft_id = "draft_bsc_reorg";
@@ -383,7 +447,18 @@ mod tests {
             .register_draft(draft_id, BroadcastNetwork::BscTestnet, 1000)
             .unwrap();
         coordinator
-            .record_signed(draft_id, "mock_hash", "0xf86c...", 1005)
+            .record_signed_bsc(
+                draft_id,
+                "mock_hash",
+                "0xf86c...",
+                "0x1111111111111111111111111111111111111111",
+                "0x2222222222222222222222222222222222222222",
+                "1000",
+                None,
+                None,
+                None,
+                1005,
+            )
             .unwrap();
 
         let tx_hash = coordinator
@@ -461,12 +536,13 @@ mod tests {
 
         // 1. First session: coordinator records transactions and confirms one
         let mut coordinator1 = TxLifecycleCoordinator::new();
+        coordinator1.set_storage_path(persist_file.clone());
         let btc_broadcaster = MockBtcBroadcaster::new();
         let bsc_broadcaster = MockBscBroadcaster::new();
 
         let btc_draft = "draft_btc_persist_01";
         coordinator1.register_draft(btc_draft, BroadcastNetwork::BitcoinSignet, 1000).unwrap();
-        coordinator1.record_signed(btc_draft, "hash_btc_1", "0200000001dead", 1005).unwrap();
+        coordinator1.record_signed_btc(btc_draft, "hash_btc_1", "0200000001dead", "txid_btc_mock", "wtxid_btc_mock", None, 1005).unwrap();
         let btc_txid = coordinator1.execute_broadcast_btc(btc_draft, &btc_broadcaster, 3, 1010).unwrap();
 
         btc_broadcaster.set_tx_status(&btc_txid, BtcTxQueryStatus::Confirmed {
@@ -478,7 +554,18 @@ mod tests {
 
         let bsc_draft = "draft_bsc_persist_01";
         coordinator1.register_draft(bsc_draft, BroadcastNetwork::BscTestnet, 1030).unwrap();
-        coordinator1.record_signed(bsc_draft, "hash_bsc_1", "f86c...", 1035).unwrap();
+        coordinator1.record_signed_bsc(
+            bsc_draft,
+            "hash_bsc_1",
+            "f86c...",
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "1000",
+            None,
+            None,
+            None,
+            1035,
+        ).unwrap();
         let _bsc_tx_hash = coordinator1.execute_broadcast_bsc(bsc_draft, &bsc_broadcaster, 3, 1040).unwrap();
 
         // Save coordinator 1 state to disk
@@ -660,8 +747,12 @@ mod tests {
             vout: 0,
         };
 
+        let dummy_sig = secp.sign_ecdsa(&secp256k1::Message::from_digest([1u8; 32]), &privkey);
+        let mut sig_bytes = dummy_sig.serialize_der().to_vec();
+        sig_bytes.push(0x01); // SIGHASH_ALL
+
         let mut witness = bitcoin::Witness::new();
-        witness.push(vec![0x30, 0x44, 0x02, 0x20, 0x01]); // mock DER sig
+        witness.push(sig_bytes);
         witness.push(privkey.public_key(&secp).serialize());
 
         let tx = bitcoin::Transaction {
@@ -684,18 +775,18 @@ mod tests {
         let actual_wtxid = tx.compute_wtxid().to_string();
 
         // 1. With exact matching txid and wtxid -> succeeds in dry run
-        let valid_res = btc_adapter.broadcast_verified(&raw_hex, &actual_txid, &actual_wtxid, BroadcastNetwork::BitcoinSignet);
+        let valid_res = btc_adapter.broadcast_verified(&raw_hex, &actual_txid, &actual_wtxid, None, BroadcastNetwork::BitcoinSignet);
         assert!(valid_res.is_ok());
 
         // 2. With altered / unexpected txid -> REJECTED
         let forged_txid = "000000000000000000000000000000000000000000000000000000000000dead";
-        let invalid_res = btc_adapter.broadcast_verified(&raw_hex, forged_txid, &actual_wtxid, BroadcastNetwork::BitcoinSignet);
+        let invalid_res = btc_adapter.broadcast_verified(&raw_hex, forged_txid, &actual_wtxid, None, BroadcastNetwork::BitcoinSignet);
         assert!(invalid_res.is_err(), "Must reject raw tx if txid does not match approved draft");
         assert!(invalid_res.unwrap_err().to_string().contains("does not match approved transaction txid"));
 
         // 3. With altered / forged wtxid (witness tampering) -> REJECTED
         let forged_wtxid = "000000000000000000000000000000000000000000000000000000000000beef";
-        let invalid_wtxid_res = btc_adapter.broadcast_verified(&raw_hex, &actual_txid, forged_wtxid, BroadcastNetwork::BitcoinSignet);
+        let invalid_wtxid_res = btc_adapter.broadcast_verified(&raw_hex, &actual_txid, forged_wtxid, None, BroadcastNetwork::BitcoinSignet);
         assert!(invalid_wtxid_res.is_err(), "Must reject raw tx if wtxid does not match approved draft");
         assert!(invalid_wtxid_res.unwrap_err().to_string().contains("witness mismatch"));
 
@@ -703,7 +794,7 @@ mod tests {
         let mut unsigned_tx = tx.clone();
         unsigned_tx.input[0].witness = bitcoin::Witness::new();
         let unsigned_hex = hex::encode(bitcoin::consensus::serialize(&unsigned_tx));
-        let unsigned_res = btc_adapter.broadcast_verified(&unsigned_hex, &actual_txid, &actual_wtxid, BroadcastNetwork::BitcoinSignet);
+        let unsigned_res = btc_adapter.broadcast_verified(&unsigned_hex, &actual_txid, &actual_wtxid, None, BroadcastNetwork::BitcoinSignet);
         assert!(unsigned_res.is_err());
         assert!(unsigned_res.unwrap_err().to_string().contains("lacks SegWit witness"));
     }
@@ -726,8 +817,13 @@ mod tests {
             vout: 0,
         };
 
+        // Create a syntactically valid DER signature for witness preflight check
+        let dummy_sig = secp_btc.sign_ecdsa(&secp256k1::Message::from_digest([1u8; 32]), &privkey_btc);
+        let mut sig_bytes = dummy_sig.serialize_der().to_vec();
+        sig_bytes.push(0x01); // SIGHASH_ALL
+
         let mut witness = bitcoin::Witness::new();
-        witness.push(vec![0x30, 0x44, 0x02, 0x20, 0xaa]); // signature
+        witness.push(sig_bytes);
         witness.push(privkey_btc.public_key(&secp_btc).serialize());
 
         let valid_btc_tx = bitcoin::Transaction {
@@ -749,9 +845,9 @@ mod tests {
         let expected_wtxid = valid_btc_tx.compute_wtxid().to_string();
 
         // BTC: Valid match succeeds
-        assert!(btc_adapter.broadcast_verified(&btc_raw_hex, &expected_txid, &expected_wtxid, BroadcastNetwork::BitcoinSignet).is_ok());
+        assert!(btc_adapter.broadcast_verified(&btc_raw_hex, &expected_txid, &expected_wtxid, None, BroadcastNetwork::BitcoinSignet).is_ok());
         // BTC: Wrong network rejected
-        assert!(btc_adapter.broadcast_verified(&btc_raw_hex, &expected_txid, &expected_wtxid, BroadcastNetwork::BscTestnet).is_err());
+        assert!(btc_adapter.broadcast_verified(&btc_raw_hex, &expected_txid, &expected_wtxid, None, BroadcastNetwork::BscTestnet).is_err());
 
         // BSC Preflight Verification:
         let bsc_adapter = RpcBscBroadcaster::new(false);
@@ -784,12 +880,15 @@ mod tests {
         let signed_bsc = bsc_tx.sign(&secp_bsc, &privkey_bsc).unwrap();
         let bsc_raw_hex = hex::encode(&signed_bsc.raw_signed_tx_bytes);
 
-        // BSC 1: Valid signed payload matches sender, recipient, amount -> PASS
+        // BSC 1: Valid signed payload matches sender, recipient, amount, nonce, gas -> PASS
         let verify_ok = bsc_adapter.dry_run_verify_against_draft(
             &bsc_raw_hex,
             Some(&expected_sender),
             Some(recipient_str),
             Some(amount_raw_str),
+            Some(5),
+            Some(65_000),
+            Some("3000000000"),
             BroadcastNetwork::BscTestnet,
         );
         assert!(verify_ok.is_ok(), "BSC preflight valid draft must succeed: {:?}", verify_ok);
@@ -801,6 +900,9 @@ mod tests {
             Some(&expected_sender),
             Some(forged_recip),
             Some(amount_raw_str),
+            Some(5),
+            Some(65_000),
+            Some("3000000000"),
             BroadcastNetwork::BscTestnet,
         );
         assert!(recip_fail.is_err(), "Must reject forged recipient");
@@ -813,6 +915,9 @@ mod tests {
             Some(&expected_sender),
             Some(recipient_str),
             Some(forged_amount),
+            Some(5),
+            Some(65_000),
+            Some("3000000000"),
             BroadcastNetwork::BscTestnet,
         );
         assert!(amount_fail.is_err(), "Must reject forged amount");
@@ -825,6 +930,9 @@ mod tests {
             Some(forged_sender),
             Some(recipient_str),
             Some(amount_raw_str),
+            Some(5),
+            Some(65_000),
+            Some("3000000000"),
             BroadcastNetwork::BscTestnet,
         );
         assert!(sender_fail.is_err(), "Must reject forged sender");
@@ -837,6 +945,9 @@ mod tests {
             Some(&expected_sender),
             Some(recipient_str),
             Some(amount_raw_str),
+            Some(5),
+            Some(65_000),
+            Some("3000000000"),
             BroadcastNetwork::BscTestnet,
         );
         assert!(trailing_fail.is_err(), "Must reject trailing garbage bytes");
@@ -856,7 +967,7 @@ mod tests {
 
         let raw_tx = "0200000001deadbeef0000000000";
         let payload_hash = "0xhash_auto_persist_test";
-        coordinator.record_signed(draft_id, payload_hash, raw_tx, 2005).unwrap();
+        coordinator.record_signed_btc(draft_id, payload_hash, raw_tx, "txid_expected_01", "wtxid_expected_01", None, 2005).unwrap();
 
         // Broadcaster mock configured to fail on broadcast with timeout
         let broadcaster = MockBtcBroadcaster::new();
@@ -892,7 +1003,7 @@ mod tests {
 
         // 1. Simulate an active connection open by acquiring a connection guard
         let conn_guard = tracker.acquire_connection().expect("Must acquire connection");
-        assert_eq!(tracker.active_connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(tracker.active_connections(), 1);
 
         // 2. Attempting to begin reset while connection is active MUST fail safely
         let reset_attempt = tracker.begin_reset();
@@ -904,7 +1015,7 @@ mod tests {
 
         // 3. Close the connection by dropping the guard
         drop(conn_guard);
-        assert_eq!(tracker.active_connections.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(tracker.active_connections(), 0);
 
         // 4. Now begin_reset succeeds
         assert!(tracker.begin_reset().is_ok());
@@ -918,5 +1029,312 @@ mod tests {
         assert!(!db_file.exists(), "Database file must be purged");
 
         tracker.finish_reset();
+    }
+
+    #[test]
+    fn test_t61_atomic_sqlite_tracker_concurrent_race() {
+        let tracker = std::sync::Arc::new(crate::wallet::SqliteTracker::default());
+        let mut handles = Vec::new();
+
+        // 8 worker threads acquiring and releasing connections
+        for _ in 0..8 {
+            let t = std::sync::Arc::clone(&tracker);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..60 {
+                    if let Ok(guard) = t.acquire_connection() {
+                        assert!(!t.is_locked(), "Must never hold an active connection while reset is locked");
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        drop(guard);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }));
+        }
+
+        // 8 reset threads attempting to lock and begin reset
+        for _ in 0..8 {
+            let t = std::sync::Arc::clone(&tracker);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..60 {
+                    if t.begin_reset().is_ok() {
+                        // Critical invariant: While reset is active, active connections must be strictly 0
+                        assert_eq!(t.active_connections(), 0, "active_connections must be 0 during reset");
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                        t.finish_reset();
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().expect("Worker thread panicked");
+        }
+
+        assert_eq!(tracker.active_connections(), 0);
+        assert!(!tracker.is_locked());
+    }
+
+    #[test]
+    fn test_t62_mandatory_signed_authorization() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let persist_file = temp_dir.path().join("t62_lifecycle.json");
+
+        // 1. Missing storage path fails immediately
+        let mut unconfigured_coord = TxLifecycleCoordinator::new();
+        let mock_btc = MockBtcBroadcaster::new();
+        let err_no_path = unconfigured_coord.execute_broadcast_btc("draft_01", &mock_btc, 1, 100);
+        assert!(err_no_path.is_err());
+        assert!(err_no_path.unwrap_err().contains("Mandatory storage path"));
+
+        let mut coord = TxLifecycleCoordinator::new();
+        coord.set_storage_path(persist_file);
+
+        // 2. BTC: Missing expected_txid / expected_wtxid fails-closed with zero fallback
+        let draft_btc = "draft_t62_btc";
+        coord.register_draft(draft_btc, BroadcastNetwork::BitcoinSignet, 100).unwrap();
+        coord.record_signed(draft_btc, "hash_01", "raw_dummy_hex", 105).unwrap();
+        let err_btc_missing = coord.execute_broadcast_btc(draft_btc, &mock_btc, 1, 110);
+        assert!(err_btc_missing.is_err());
+        assert!(err_btc_missing.unwrap_err().contains("missing approved expected_txid"));
+
+        // 3. BSC: Missing expected_sender / recipient / amount fails-closed with zero fallback
+        let draft_bsc = "draft_t62_bsc";
+        let mock_bsc = MockBscBroadcaster::new();
+        coord.register_draft(draft_bsc, BroadcastNetwork::BscTestnet, 200).unwrap();
+        coord.record_signed(draft_bsc, "hash_02", "raw_dummy_hex_bsc", 205).unwrap();
+        let err_bsc_missing = coord.execute_broadcast_bsc(draft_bsc, &mock_bsc, 1, 210);
+        assert!(err_bsc_missing.is_err());
+        assert!(err_bsc_missing.unwrap_err().contains("missing approved expected_sender"));
+    }
+
+    #[test]
+    fn test_t63_real_signature_preflight() {
+        // --- BTC Real Signature & BIP-143 Sighash Verification ---
+        let btc_adapter = EsploraBtcBroadcaster::new(false);
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let privkey = bip::derive_bip84_privkey_at(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            bitcoin::Network::Signet,
+            0,
+            0,
+        ).unwrap();
+        let pubkey = privkey.public_key(&secp);
+        let script_pubkey = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::hash(&pubkey.serialize()));
+
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_str("0000000000000000000000000000000000000000000000000000000000000009").unwrap(),
+            vout: 0,
+        };
+
+        let mut tx_to_sign = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(50_000),
+                script_pubkey: script_pubkey.clone(),
+            }],
+        };
+
+        // Compute genuine BIP-143 sighash
+        let mut sighash_cache = bitcoin::sighash::SighashCache::new(&tx_to_sign);
+        let sighash = sighash_cache.p2wpkh_signature_hash(
+            0,
+            &script_pubkey,
+            bitcoin::Amount::from_sat(55_000),
+            bitcoin::sighash::EcdsaSighashType::All,
+        ).unwrap();
+        let msg = secp256k1::Message::from_digest(sighash.to_byte_array());
+        let real_sig = secp.sign_ecdsa(&msg, &privkey);
+        let mut sig_bytes = real_sig.serialize_der().to_vec();
+        sig_bytes.push(0x01); // SIGHASH_ALL
+
+        let mut witness = bitcoin::Witness::new();
+        witness.push(sig_bytes.clone());
+        witness.push(pubkey.serialize());
+        tx_to_sign.input[0].witness = witness;
+
+        let valid_btc_hex = hex::encode(bitcoin::consensus::serialize(&tx_to_sign));
+        let expected_txid = tx_to_sign.compute_txid().to_string();
+        let expected_wtxid = tx_to_sign.compute_wtxid().to_string();
+
+        // 1. Valid signed BTC tx with input values passes cryptographic verification
+        let valid_res = btc_adapter.broadcast_verified(
+            &valid_btc_hex,
+            &expected_txid,
+            &expected_wtxid,
+            Some(&[55_000]),
+            BroadcastNetwork::BitcoinSignet,
+        );
+        assert!(valid_res.is_ok(), "Valid BIP-143 signed tx must pass: {:?}", valid_res);
+
+        // 2. Corrupted signature byte fails ECDSA verification
+        let mut corrupted_sig_bytes = sig_bytes.clone();
+        let last_idx = corrupted_sig_bytes.len() - 3;
+        corrupted_sig_bytes[last_idx] ^= 0x55; // flip signature bits
+        let mut corrupted_tx = tx_to_sign.clone();
+        let mut bad_witness = bitcoin::Witness::new();
+        bad_witness.push(corrupted_sig_bytes);
+        bad_witness.push(pubkey.serialize());
+        corrupted_tx.input[0].witness = bad_witness;
+        let corrupted_btc_hex = hex::encode(bitcoin::consensus::serialize(&corrupted_tx));
+
+        let bad_sig_res = btc_adapter.broadcast_verified(
+            &corrupted_btc_hex,
+            &corrupted_tx.compute_txid().to_string(),
+            &corrupted_tx.compute_wtxid().to_string(),
+            Some(&[55_000]),
+            BroadcastNetwork::BitcoinSignet,
+        );
+        assert!(bad_sig_res.is_err(), "Corrupted signature byte must fail cryptographic verification");
+
+        // 3. Dummy / mock witness fails immediately
+        let mut dummy_tx = tx_to_sign.clone();
+        let mut dummy_witness = bitcoin::Witness::new();
+        dummy_witness.push(vec![0x30, 0x44, 0x02, 0x20, 0xaa]); // truncated mock
+        dummy_witness.push(pubkey.serialize());
+        dummy_tx.input[0].witness = dummy_witness;
+        let dummy_hex = hex::encode(bitcoin::consensus::serialize(&dummy_tx));
+        let dummy_res = btc_adapter.dry_run_verify(&dummy_hex, BroadcastNetwork::BitcoinSignet);
+        assert!(dummy_res.is_err(), "Mock dummy witness must fail preflight check");
+
+        // --- BSC Parameter Tampering Verification ---
+        let bsc_adapter = RpcBscBroadcaster::new(false);
+        let secp_bsc = secp256k1::Secp256k1::new();
+        let privkey_bsc = secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let pubkey_bsc = secp256k1::PublicKey::from_secret_key(&secp_bsc, &privkey_bsc);
+        let uncompressed = pubkey_bsc.serialize_uncompressed();
+        let mut hasher = tiny_keccak::Keccak::v256();
+        let mut addr_hash = [0u8; 32];
+        hasher.update(&uncompressed[1..]);
+        hasher.finalize(&mut addr_hash);
+        let sender = crate::wallet::tx::policy::to_eip55_checksum(&hex::encode(&addr_hash[12..32]));
+
+        let recipient = "0x9858EfFD232B4033E47d90003D41EC34EcaEda94";
+        let amount_str = "1000000000000000000"; // 1 USDT
+        let calldata = crate::wallet::tx::bsc::calldata::encode_erc20_transfer(
+            recipient,
+            &num_bigint::BigUint::from(1000000000000000000u64),
+        ).unwrap();
+
+        let tx_bsc = crate::wallet::signer::bsc::Eip155Transaction {
+            nonce: 10,
+            gas_price: num_bigint::BigUint::from(5_000_000_000u64),
+            gas_limit: 70_000,
+            to: crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT.to_string(),
+            value: num_bigint::BigUint::from(0u32),
+            data: hex::decode(calldata.trim_start_matches("0x")).unwrap(),
+            chain_id: 97,
+        };
+        let signed_bsc = tx_bsc.sign(&secp_bsc, &privkey_bsc).unwrap();
+        let bsc_hex = hex::encode(&signed_bsc.raw_signed_tx_bytes);
+
+        // Valid match passes
+        assert!(bsc_adapter.dry_run_verify_against_draft(
+            &bsc_hex,
+            Some(&sender),
+            Some(recipient),
+            Some(amount_str),
+            Some(10),
+            Some(70_000),
+            Some("5000000000"),
+            BroadcastNetwork::BscTestnet,
+        ).is_ok());
+
+        // Modified nonce fails
+        let bad_nonce = bsc_adapter.dry_run_verify_against_draft(
+            &bsc_hex,
+            Some(&sender),
+            Some(recipient),
+            Some(amount_str),
+            Some(11), // Expected 11 but tx has 10
+            Some(70_000),
+            Some("5000000000"),
+            BroadcastNetwork::BscTestnet,
+        );
+        assert!(bad_nonce.is_err());
+        assert!(bad_nonce.unwrap_err().to_string().contains("nonce"));
+
+        // Modified gas_limit fails
+        let bad_gas = bsc_adapter.dry_run_verify_against_draft(
+            &bsc_hex,
+            Some(&sender),
+            Some(recipient),
+            Some(amount_str),
+            Some(10),
+            Some(80_000), // Expected 80_000 but tx has 70_000
+            Some("5000000000"),
+            BroadcastNetwork::BscTestnet,
+        );
+        assert!(bad_gas.is_err());
+        assert!(bad_gas.unwrap_err().to_string().contains("gas limit"));
+    }
+
+    #[test]
+    fn test_t64_kill_restart_broadcast_and_recovery() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage_file = temp_dir.path().join("t64_recovery.json");
+
+        let draft_id = "draft_t64_lifecycle";
+        let raw_tx = "020000000100000000000000000000000000000000000000000000000000000000000000000000000000ffffffff";
+        let txid = "txid_t64_recovery_test";
+        let wtxid = "wtxid_t64_recovery_test";
+
+        // Phase 1: Setup draft, record signed, initiate broadcast with timeout
+        {
+            let mut coordinator = TxLifecycleCoordinator::new();
+            coordinator.set_storage_path(storage_file.clone());
+            coordinator.register_draft(draft_id, BroadcastNetwork::BitcoinSignet, 5000).unwrap();
+            coordinator.record_signed_btc(draft_id, "payload_hash_t64", raw_tx, txid, wtxid, None, 5005).unwrap();
+
+            let broadcaster = MockBtcBroadcaster::new();
+            broadcaster.next_broadcast_result.lock().unwrap().replace(Err(BtcBroadcastError::Timeout("Network timeout during broadcast".into())));
+
+            let res = coordinator.execute_broadcast_btc(draft_id, &broadcaster, 1, 5010);
+            assert!(res.is_err(), "Broadcast must report transient error");
+            // Coordinator is dropped here (simulating crash / app shutdown)
+        }
+
+        // Phase 2: RESTART FROM DISK
+        assert!(storage_file.exists(), "Lifecycle file must have been auto-persisted prior to crash");
+        let mut restored_coord = TxLifecycleCoordinator::load_from_file(&storage_file).unwrap();
+        let record = restored_coord.get_record(draft_id).unwrap();
+        assert!(matches!(record.status, TxLifecycleStatus::Failed { permanent: false, .. }));
+        assert_eq!(record.raw_tx_hex.as_deref(), Some(raw_tx));
+        assert_eq!(record.expected_txid.as_deref(), Some(txid));
+        assert_eq!(record.expected_wtxid.as_deref(), Some(wtxid));
+
+        // Phase 3: Resume broadcast WITHOUT re-signing
+        let broadcaster = MockBtcBroadcaster::new();
+        // Broadcaster now succeeds and returns txid
+        broadcaster.set_next_broadcast_result(Ok(txid.to_string()));
+        let resume_res = restored_coord.execute_broadcast_btc(draft_id, &broadcaster, 1, 5020);
+        assert!(resume_res.is_ok(), "Must resume broadcast successfully without re-signing: {:?}", resume_res);
+
+        // Verify status moved to Pending and persisted
+        let record_pending = restored_coord.get_record(draft_id).unwrap();
+        assert!(matches!(record_pending.status, TxLifecycleStatus::Pending { .. }));
+
+        // Phase 4: Poll status to Confirmed
+        broadcaster.set_tx_status(txid, BtcTxQueryStatus::Confirmed {
+            block_height: 800_000,
+            block_hash: "0000000000000000000000000000000000000000000000000000000000abcdef".to_string(),
+            confirmations: 1,
+        });
+        let poll_res = restored_coord.poll_btc_lifecycle(draft_id, &broadcaster, 5030);
+        assert!(poll_res.is_ok());
+        assert!(matches!(poll_res.unwrap(), TxLifecycleStatus::Confirmed { .. }));
+
+        // Phase 5: Reload once more to confirm final Confirmed status is on disk
+        drop(restored_coord);
+        let final_coord = TxLifecycleCoordinator::load_from_file(&storage_file).unwrap();
+        let final_rec = final_coord.get_record(draft_id).unwrap();
+        assert!(matches!(final_rec.status, TxLifecycleStatus::Confirmed { .. }));
     }
 }

@@ -106,8 +106,18 @@ impl TxLifecycleStatus {
             }
             // Broadcasting -> Pending (tx accepted in mempool)
             (TxLifecycleStatus::Broadcasting { .. }, TxLifecycleStatus::Pending { .. }) => true,
+            // Broadcasting -> Confirmed (polled after crash/restart and found already mined)
+            (TxLifecycleStatus::Broadcasting { .. }, TxLifecycleStatus::Confirmed { .. }) => true,
+            // Broadcasting -> Dropped
+            (TxLifecycleStatus::Broadcasting { .. }, TxLifecycleStatus::Dropped { .. }) => true,
             // Broadcasting -> Failed
             (TxLifecycleStatus::Broadcasting { .. }, TxLifecycleStatus::Failed { .. }) => true,
+            // Failed (transient / non-permanent) -> Broadcasting (retry/resume after crash or timeout)
+            (TxLifecycleStatus::Failed { permanent: false, .. }, TxLifecycleStatus::Broadcasting { .. }) => true,
+            // Failed (transient / non-permanent) -> Pending (discovered tx reached mempool)
+            (TxLifecycleStatus::Failed { permanent: false, .. }, TxLifecycleStatus::Pending { .. }) => true,
+            // Failed (transient / non-permanent) -> Confirmed (discovered tx mined)
+            (TxLifecycleStatus::Failed { permanent: false, .. }, TxLifecycleStatus::Confirmed { .. }) => true,
             // Pending -> Confirmed
             (TxLifecycleStatus::Pending { tx_hash: h1, .. }, TxLifecycleStatus::Confirmed { tx_hash: h2, .. }) => {
                 h1 == h2
@@ -161,9 +171,13 @@ pub struct TxLifecycleRecord {
     pub payload_hash: Option<String>,
     pub expected_txid: Option<String>,
     pub expected_wtxid: Option<String>,
+    pub expected_input_values: Option<Vec<u64>>,
     pub expected_sender: Option<String>,
     pub expected_recipient: Option<String>,
     pub expected_amount_raw: Option<String>,
+    pub expected_nonce: Option<u64>,
+    pub expected_gas_limit: Option<u64>,
+    pub expected_gas_price: Option<String>,
     pub status: TxLifecycleStatus,
     pub created_at_unix: u64,
     pub updated_at_unix: u64,
@@ -181,9 +195,13 @@ impl TxLifecycleRecord {
             payload_hash: None,
             expected_txid: None,
             expected_wtxid: None,
+            expected_input_values: None,
             expected_sender: None,
             expected_recipient: None,
             expected_amount_raw: None,
+            expected_nonce: None,
+            expected_gas_limit: None,
+            expected_gas_price: None,
             status: TxLifecycleStatus::DraftCreated { draft_id },
             created_at_unix: now_unix,
             updated_at_unix: now_unix,

@@ -115,6 +115,9 @@ pub trait BscBroadcaster: Send + Sync {
         expected_sender: Option<&str>,
         expected_recipient: Option<&str>,
         expected_amount_raw: Option<&str>,
+        expected_nonce: Option<u64>,
+        expected_gas_limit: Option<u64>,
+        expected_gas_price: Option<&str>,
         network: BroadcastNetwork,
     ) -> Result<String, BscBroadcastError>;
     fn query_receipt(&self, tx_hash: &str, network: BroadcastNetwork) -> Result<BscReceiptStatus, BscBroadcastError>;
@@ -188,6 +191,9 @@ impl BscBroadcaster for MockBscBroadcaster {
         _expected_sender: Option<&str>,
         _expected_recipient: Option<&str>,
         _expected_amount_raw: Option<&str>,
+        _expected_nonce: Option<u64>,
+        _expected_gas_limit: Option<u64>,
+        _expected_gas_price: Option<&str>,
         network: BroadcastNetwork,
     ) -> Result<String, BscBroadcastError> {
         self.broadcast(raw_signed_hex, network)
@@ -321,6 +327,9 @@ impl RpcBscBroadcaster {
         expected_sender: Option<&str>,
         expected_recipient: Option<&str>,
         expected_amount_raw: Option<&str>,
+        expected_nonce: Option<u64>,
+        expected_gas_limit: Option<u64>,
+        expected_gas_price: Option<&str>,
         network: BroadcastNetwork,
     ) -> Result<String, BscBroadcastError> {
         if network != BroadcastNetwork::BscTestnet {
@@ -446,7 +455,7 @@ impl RpcBscBroadcaster {
         // 10. Reconstruct Eip155SignedTransaction and cryptographically verify signature & recover sender
         let tx = crate::wallet::signer::bsc::Eip155Transaction {
             nonce,
-            gas_price,
+            gas_price: gas_price.clone(),
             gas_limit,
             to: to_addr,
             value,
@@ -497,6 +506,34 @@ impl RpcBscBroadcaster {
             }
         }
 
+        if let Some(exp_nonce) = expected_nonce {
+            if nonce != exp_nonce {
+                return Err(BscBroadcastError::RpcError {
+                    code: -32602,
+                    message: format!("Decoded nonce '{}' does not match approved draft nonce '{}'", nonce, exp_nonce),
+                });
+            }
+        }
+
+        if let Some(exp_gas_limit) = expected_gas_limit {
+            if gas_limit != exp_gas_limit {
+                return Err(BscBroadcastError::RpcError {
+                    code: -32602,
+                    message: format!("Decoded gas limit '{}' does not match approved draft gas limit '{}'", gas_limit, exp_gas_limit),
+                });
+            }
+        }
+
+        if let Some(exp_gas_price) = expected_gas_price {
+            let actual_gas_price_str = gas_price.to_str_radix(10);
+            if actual_gas_price_str != exp_gas_price {
+                return Err(BscBroadcastError::RpcError {
+                    code: -32602,
+                    message: format!("Decoded gas price '{}' does not match approved draft gas price '{}'", actual_gas_price_str, exp_gas_price),
+                });
+            }
+        }
+
         // 12. Local Keccak-256 hash calculation
         let mut hasher = Keccak::v256();
         let mut hash = [0u8; 32];
@@ -509,7 +546,7 @@ impl RpcBscBroadcaster {
     /// Dry-run verification (G5A): Decodes RLP, parses EIP-155 signature fields,
     /// verifies chain ID 97, recipient contract, zero value, ERC-20 selector, and recovers signature
     pub fn dry_run_verify(&self, raw_tx_hex: &str, network: BroadcastNetwork) -> Result<String, BscBroadcastError> {
-        self.dry_run_verify_against_draft(raw_tx_hex, None, None, None, network)
+        self.dry_run_verify_against_draft(raw_tx_hex, None, None, None, None, None, None, network)
     }
 
     /// Dry-run query: strictly parses nonce and balance via JSON-RPC without unwrap_or(0) defaults
@@ -611,6 +648,20 @@ impl RpcBscBroadcaster {
         let json: serde_json::Value = resp.json()
             .map_err(|e| BscBroadcastError::RpcError { code: -32700, message: format!("Failed to parse RPC JSON: {}", e) })?;
 
+        if json.get("jsonrpc").and_then(|v| v.as_str()) != Some("2.0") {
+            return Err(BscBroadcastError::RpcError {
+                code: -32600,
+                message: "Invalid RPC response: missing or invalid jsonrpc version (must be 2.0)".to_string(),
+            });
+        }
+
+        if json.get("id").and_then(|v| v.as_u64()) != Some(1) {
+            return Err(BscBroadcastError::RpcError {
+                code: -32600,
+                message: "Invalid RPC response: id mismatch (expected 1)".to_string(),
+            });
+        }
+
         if let Some(err) = json.get("error") {
             let code = err.get("code").and_then(|v| v.as_i64()).unwrap_or(-32000);
             let message = err.get("message").and_then(|v| v.as_str()).unwrap_or("Unknown RPC error");
@@ -672,6 +723,9 @@ impl BscBroadcaster for RpcBscBroadcaster {
         expected_sender: Option<&str>,
         expected_recipient: Option<&str>,
         expected_amount_raw: Option<&str>,
+        expected_nonce: Option<u64>,
+        expected_gas_limit: Option<u64>,
+        expected_gas_price: Option<&str>,
         network: BroadcastNetwork,
     ) -> Result<String, BscBroadcastError> {
         let computed_hash = self.dry_run_verify_against_draft(
@@ -679,6 +733,9 @@ impl BscBroadcaster for RpcBscBroadcaster {
             expected_sender,
             expected_recipient,
             expected_amount_raw,
+            expected_nonce,
+            expected_gas_limit,
+            expected_gas_price,
             network,
         )?;
 

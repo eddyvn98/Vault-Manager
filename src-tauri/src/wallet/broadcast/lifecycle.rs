@@ -162,6 +162,7 @@ impl TxLifecycleCoordinator {
         raw_tx_hex: &str,
         txid: &str,
         wtxid: &str,
+        input_values: Option<Vec<u64>>,
         now_unix: u64,
     ) -> Result<(), String> {
         {
@@ -171,6 +172,7 @@ impl TxLifecycleCoordinator {
                 .ok_or_else(|| format!("Draft '{}' not found", draft_id))?;
             record.expected_txid = Some(txid.to_string());
             record.expected_wtxid = Some(wtxid.to_string());
+            record.expected_input_values = input_values;
         }
         let signed_status = TxLifecycleStatus::Signed {
             draft_id: draft_id.to_string(),
@@ -188,6 +190,9 @@ impl TxLifecycleCoordinator {
         sender: &str,
         recipient: &str,
         amount_raw: &str,
+        nonce: Option<u64>,
+        gas_limit: Option<u64>,
+        gas_price: Option<String>,
         now_unix: u64,
     ) -> Result<(), String> {
         {
@@ -198,6 +203,9 @@ impl TxLifecycleCoordinator {
             record.expected_sender = Some(sender.to_string());
             record.expected_recipient = Some(recipient.to_string());
             record.expected_amount_raw = Some(amount_raw.to_string());
+            record.expected_nonce = nonce;
+            record.expected_gas_limit = gas_limit;
+            record.expected_gas_price = gas_price;
         }
         let signed_status = TxLifecycleStatus::Signed {
             draft_id: draft_id.to_string(),
@@ -214,7 +222,12 @@ impl TxLifecycleCoordinator {
         max_retries: u32,
         now_unix: u64,
     ) -> Result<String, String> {
-        let (raw_hex, expected_txid, expected_wtxid, network) = {
+        // Mandatory persistence configuration
+        if self.storage_path.is_none() {
+            return Err("Mandatory storage path is not configured on TxLifecycleCoordinator".to_string());
+        }
+
+        let (raw_hex, expected_txid, expected_wtxid, expected_input_values, network) = {
             let record = self
                 .records
                 .get(draft_id)
@@ -224,19 +237,30 @@ impl TxLifecycleCoordinator {
                 return Err("BTC broadcast requested for non-Bitcoin network".to_string());
             }
 
+            let expected_txid = record.expected_txid.as_ref().ok_or_else(|| {
+                "Mandatory draft verification failure: missing approved expected_txid".to_string()
+            })?.clone();
+            let expected_wtxid = record.expected_wtxid.as_ref().ok_or_else(|| {
+                "Mandatory draft verification failure: missing approved expected_wtxid".to_string()
+            })?.clone();
+            let expected_input_values = record.expected_input_values.clone();
+
             let raw = match &record.status {
                 TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
                 TxLifecycleStatus::Broadcasting { .. } => {
                     record.raw_tx_hex.clone().ok_or_else(|| "Missing raw_tx_hex in record".to_string())?
                 }
+                TxLifecycleStatus::Failed { permanent: false, .. } => {
+                    record.raw_tx_hex.clone().ok_or_else(|| "Missing raw_tx_hex in record".to_string())?
+                }
                 other => {
                     return Err(format!(
-                        "Cannot broadcast transaction in state '{:?}', must be Signed or Broadcasting",
+                        "Cannot broadcast transaction in state '{:?}', must be Signed, Broadcasting, or non-permanent Failed",
                         other
                     ))
                 }
             };
-            (raw, record.expected_txid.clone(), record.expected_wtxid.clone(), record.network)
+            (raw, expected_txid, expected_wtxid, expected_input_values, record.network)
         };
 
         let mut attempt = 0u32;
@@ -249,11 +273,13 @@ impl TxLifecycleCoordinator {
             // AUTO-PERSIST BEFORE NETWORK I/O (P1 Hardening)
             self.transition_record_and_persist(draft_id, broadcasting_status, now_unix)?;
 
-            let broadcast_res = if let (Some(txid), Some(wtxid)) = (&expected_txid, &expected_wtxid) {
-                broadcaster.broadcast_verified(&raw_hex, txid, wtxid, network)
-            } else {
-                broadcaster.broadcast(&raw_hex, network)
-            };
+            let broadcast_res = broadcaster.broadcast_verified(
+                &raw_hex,
+                &expected_txid,
+                &expected_wtxid,
+                expected_input_values.as_deref(),
+                network,
+            );
 
             match broadcast_res {
                 Ok(txid) => {
@@ -295,7 +321,12 @@ impl TxLifecycleCoordinator {
         max_retries: u32,
         now_unix: u64,
     ) -> Result<String, String> {
-        let (raw_hex, expected_sender, expected_recipient, expected_amount_raw, network) = {
+        // Mandatory persistence configuration
+        if self.storage_path.is_none() {
+            return Err("Mandatory storage path is not configured on TxLifecycleCoordinator".to_string());
+        }
+
+        let (raw_hex, expected_sender, expected_recipient, expected_amount_raw, expected_nonce, expected_gas_limit, expected_gas_price, network) = {
             let record = self
                 .records
                 .get(draft_id)
@@ -305,23 +336,39 @@ impl TxLifecycleCoordinator {
                 return Err("BSC broadcast requested for non-BSC network".to_string());
             }
 
+            let expected_sender = record.expected_sender.as_ref().ok_or_else(|| {
+                "Mandatory draft verification failure: missing approved expected_sender".to_string()
+            })?.clone();
+            let expected_recipient = record.expected_recipient.as_ref().ok_or_else(|| {
+                "Mandatory draft verification failure: missing approved expected_recipient".to_string()
+            })?.clone();
+            let expected_amount_raw = record.expected_amount_raw.as_ref().ok_or_else(|| {
+                "Mandatory draft verification failure: missing approved expected_amount_raw".to_string()
+            })?.clone();
+
             let raw = match &record.status {
                 TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
                 TxLifecycleStatus::Broadcasting { .. } => {
                     record.raw_tx_hex.clone().ok_or_else(|| "Missing raw_tx_hex in record".to_string())?
                 }
+                TxLifecycleStatus::Failed { permanent: false, .. } => {
+                    record.raw_tx_hex.clone().ok_or_else(|| "Missing raw_tx_hex in record".to_string())?
+                }
                 other => {
                     return Err(format!(
-                        "Cannot broadcast transaction in state '{:?}', must be Signed or Broadcasting",
+                        "Cannot broadcast transaction in state '{:?}', must be Signed, Broadcasting, or non-permanent Failed",
                         other
                     ))
                 }
             };
             (
                 raw,
-                record.expected_sender.clone(),
-                record.expected_recipient.clone(),
-                record.expected_amount_raw.clone(),
+                expected_sender,
+                expected_recipient,
+                expected_amount_raw,
+                record.expected_nonce,
+                record.expected_gas_limit,
+                record.expected_gas_price.clone(),
                 record.network,
             )
         };
@@ -338,9 +385,12 @@ impl TxLifecycleCoordinator {
 
             let broadcast_res = broadcaster.broadcast_verified(
                 &raw_hex,
-                expected_sender.as_deref(),
-                expected_recipient.as_deref(),
-                expected_amount_raw.as_deref(),
+                Some(&expected_sender),
+                Some(&expected_recipient),
+                Some(&expected_amount_raw),
+                expected_nonce,
+                expected_gas_limit,
+                expected_gas_price.as_deref(),
                 network,
             );
 
@@ -390,9 +440,16 @@ impl TxLifecycleCoordinator {
         let txid = match &record.status {
             TxLifecycleStatus::Pending { tx_hash, .. } => tx_hash.clone(),
             TxLifecycleStatus::Confirmed { tx_hash, .. } => tx_hash.clone(),
+            TxLifecycleStatus::Broadcasting { .. } | TxLifecycleStatus::Failed { permanent: false, .. } => {
+                record
+                    .tx_hash
+                    .clone()
+                    .or_else(|| record.expected_txid.clone())
+                    .ok_or_else(|| "Cannot poll BTC lifecycle: missing txid in record".to_string())?
+            }
             other => {
                 return Err(format!(
-                    "Cannot poll BTC lifecycle in status '{:?}', must be Pending or Confirmed",
+                    "Cannot poll BTC lifecycle in status '{:?}', must be Pending, Confirmed, Broadcasting, or non-permanent Failed",
                     other
                 ))
             }
@@ -402,7 +459,7 @@ impl TxLifecycleCoordinator {
             .query_status(&txid, record.network)
             .map_err(|e| format!("Query BTC status error: {}", e))?;
 
-        match status {
+        let res = match status {
             BtcTxQueryStatus::NotFound => {
                 // If previously confirmed and now not found -> reorg or dropped!
                 if let TxLifecycleStatus::Confirmed { block_height, .. } = record.status {
@@ -412,20 +469,22 @@ impl TxLifecycleCoordinator {
                         previous_block_hash: "".to_string(),
                     };
                     record.transition_to(reorg.clone(), now_unix)?;
-                    return Ok(reorg);
-                }
-                // If pending for > 7200 seconds (2 hours) and still not found, mark dropped
-                if let TxLifecycleStatus::Pending { first_seen_unix, .. } = record.status {
+                    reorg
+                } else if let TxLifecycleStatus::Pending { first_seen_unix, .. } = record.status {
+                    // If pending for > 7200 seconds (2 hours) and still not found, mark dropped
                     if now_unix.saturating_sub(first_seen_unix) > 7200 {
                         let dropped = TxLifecycleStatus::Dropped {
                             tx_hash: txid,
                             reason: "Evicted from mempool after TTL".to_string(),
                         };
                         record.transition_to(dropped.clone(), now_unix)?;
-                        return Ok(dropped);
+                        dropped
+                    } else {
+                        record.status.clone()
                     }
+                } else {
+                    record.status.clone()
                 }
-                Ok(record.status.clone())
             }
             BtcTxQueryStatus::InMempool => {
                 let pending = TxLifecycleStatus::Pending {
@@ -436,7 +495,7 @@ impl TxLifecycleCoordinator {
                 if !matches!(record.status, TxLifecycleStatus::Pending { .. }) {
                     record.transition_to(pending.clone(), now_unix)?;
                 }
-                Ok(record.status.clone())
+                record.status.clone()
             }
             BtcTxQueryStatus::Confirmed {
                 block_height,
@@ -452,6 +511,7 @@ impl TxLifecycleCoordinator {
                             previous_block_hash: prev_hash.clone(),
                         };
                         record.transition_to(reorg.clone(), now_unix)?;
+                        self.persist_if_configured()?;
                         return Ok(reorg);
                     }
                 }
@@ -466,7 +526,7 @@ impl TxLifecycleCoordinator {
                     confirmations,
                 };
                 record.transition_to(confirmed.clone(), now_unix)?;
-                Ok(confirmed)
+                confirmed
             }
             BtcTxQueryStatus::Replaced { replacing_txid } => {
                 let replaced = TxLifecycleStatus::Replaced {
@@ -475,9 +535,12 @@ impl TxLifecycleCoordinator {
                     reason: "Replaced via RBF in mempool".to_string(),
                 };
                 record.transition_to(replaced.clone(), now_unix)?;
-                Ok(replaced)
+                replaced
             }
-        }
+        };
+
+        self.persist_if_configured()?;
+        Ok(res)
     }
 
     pub fn poll_bsc_lifecycle(
@@ -495,9 +558,15 @@ impl TxLifecycleCoordinator {
             TxLifecycleStatus::Pending { tx_hash, .. } => tx_hash.clone(),
             TxLifecycleStatus::Confirmed { tx_hash, .. } => tx_hash.clone(),
             TxLifecycleStatus::ReorgDetected { tx_hash, .. } => tx_hash.clone(),
+            TxLifecycleStatus::Broadcasting { .. } | TxLifecycleStatus::Failed { permanent: false, .. } => {
+                record
+                    .tx_hash
+                    .clone()
+                    .ok_or_else(|| "Cannot poll BSC lifecycle: missing tx_hash in record".to_string())?
+            }
             other => {
                 return Err(format!(
-                    "Cannot poll BSC lifecycle in status '{:?}', must be Pending, Confirmed, or ReorgDetected",
+                    "Cannot poll BSC lifecycle in status '{:?}', must be Pending, Confirmed, ReorgDetected, Broadcasting, or non-permanent Failed",
                     other
                 ))
             }
@@ -507,7 +576,7 @@ impl TxLifecycleCoordinator {
             .query_receipt(&tx_hash, record.network)
             .map_err(|e| format!("Query BSC receipt error: {}", e))?;
 
-        match receipt {
+        let res = match receipt {
             BscReceiptStatus::Pending => {
                 // If the transaction was previously Confirmed and now receipt returned Pending or disappeared,
                 // this indicates a chain reorganization fork has dropped or invalidated the receipt!
@@ -518,9 +587,10 @@ impl TxLifecycleCoordinator {
                         previous_block_hash: block_hash.clone(),
                     };
                     record.transition_to(reorg.clone(), now_unix)?;
-                    return Ok(reorg);
+                    reorg
+                } else {
+                    record.status.clone()
                 }
-                Ok(record.status.clone())
             }
             BscReceiptStatus::Success {
                 block_number,
@@ -536,6 +606,7 @@ impl TxLifecycleCoordinator {
                             previous_block_hash: prev_hash.clone(),
                         };
                         record.transition_to(reorg.clone(), now_unix)?;
+                        self.persist_if_configured()?;
                         return Ok(reorg);
                     }
                 }
@@ -550,7 +621,7 @@ impl TxLifecycleCoordinator {
                     confirmations: 1,
                 };
                 record.transition_to(confirmed.clone(), now_unix)?;
-                Ok(confirmed)
+                confirmed
             }
             BscReceiptStatus::Reverted {
                 reason, ..
@@ -561,8 +632,11 @@ impl TxLifecycleCoordinator {
                     permanent: true,
                 };
                 record.transition_to(failed.clone(), now_unix)?;
-                Ok(failed)
+                failed
             }
-        }
+        };
+
+        self.persist_if_configured()?;
+        Ok(res)
     }
 }

@@ -1,4 +1,5 @@
 use crate::wallet::broadcast::types::BroadcastNetwork;
+use bitcoin::hashes::Hash;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use tiny_keccak::{Hasher, Keccak};
@@ -89,6 +90,7 @@ pub trait BtcBroadcaster: Send + Sync {
         raw_tx_hex: &str,
         expected_txid: &str,
         expected_wtxid: &str,
+        expected_input_values: Option<&[u64]>,
         network: BroadcastNetwork,
     ) -> Result<String, BtcBroadcastError>;
     fn query_status(&self, txid: &str, network: BroadcastNetwork) -> Result<BtcTxQueryStatus, BtcBroadcastError>;
@@ -160,6 +162,7 @@ impl BtcBroadcaster for MockBtcBroadcaster {
         raw_tx_hex: &str,
         _expected_txid: &str,
         _expected_wtxid: &str,
+        _expected_input_values: Option<&[u64]>,
         network: BroadcastNetwork,
     ) -> Result<String, BtcBroadcastError> {
         self.broadcast(raw_tx_hex, network)
@@ -237,6 +240,41 @@ impl EsploraBtcBroadcaster {
                     i
                 )));
             }
+            if input.witness.len() != 2 {
+                return Err(BtcBroadcastError::NodeRejected(format!(
+                    "Input {} has invalid witness element count: expected 2 elements [sig, pubkey] for BIP84 P2WPKH, got {}",
+                    i, input.witness.len()
+                )));
+            }
+            let sig_bytes = input.witness.nth(0).unwrap();
+            let pubkey_bytes = input.witness.nth(1).unwrap();
+
+            if pubkey_bytes.len() != 33 {
+                return Err(BtcBroadcastError::NodeRejected(format!(
+                    "Input {} has invalid pubkey length: expected 33 bytes compressed pubkey, got {}",
+                    i, pubkey_bytes.len()
+                )));
+            }
+            secp256k1::PublicKey::from_slice(pubkey_bytes).map_err(|e| {
+                BtcBroadcastError::NodeRejected(format!("Input {} has invalid compressed public key: {}", i, e))
+            })?;
+
+            if sig_bytes.is_empty() {
+                return Err(BtcBroadcastError::NodeRejected(format!(
+                    "Input {} has empty signature in witness", i
+                )));
+            }
+            let sighash_type = sig_bytes[sig_bytes.len() - 1];
+            if sighash_type != 0x01 {
+                return Err(BtcBroadcastError::NodeRejected(format!(
+                    "Input {} has unsupported sighash type 0x{:02x}, only SIGHASH_ALL (0x01) supported",
+                    i, sighash_type
+                )));
+            }
+            let der_bytes = &sig_bytes[..sig_bytes.len() - 1];
+            secp256k1::ecdsa::Signature::from_der(der_bytes).map_err(|e| {
+                BtcBroadcastError::NodeRejected(format!("Input {} has invalid DER signature: {}", i, e))
+            })?;
         }
 
         let computed_txid = tx.compute_txid().to_string();
@@ -244,9 +282,63 @@ impl EsploraBtcBroadcaster {
         Ok((tx, computed_txid, computed_wtxid))
     }
 
+    /// Cryptographically verifies ECDSA DER signatures against compressed pubkeys and BIP-143 sighash
+    pub fn verify_input_signatures(&self, tx: &bitcoin::Transaction, prev_values: &[u64]) -> Result<(), BtcBroadcastError> {
+        if prev_values.len() != tx.input.len() {
+            return Err(BtcBroadcastError::NodeRejected(format!(
+                "Approved input values count ({}) does not match transaction input count ({})",
+                prev_values.len(), tx.input.len()
+            )));
+        }
+
+        let mut sighash_cache = bitcoin::sighash::SighashCache::new(tx);
+        let secp = secp256k1::Secp256k1::verification_only();
+
+        for (i, &val) in prev_values.iter().enumerate() {
+            let witness = &tx.input[i].witness;
+            let sig_bytes = witness.nth(0).ok_or_else(|| {
+                BtcBroadcastError::NodeRejected(format!("Input {} missing signature witness", i))
+            })?;
+            let pubkey_bytes = witness.nth(1).ok_or_else(|| {
+                BtcBroadcastError::NodeRejected(format!("Input {} missing pubkey witness", i))
+            })?;
+
+            let pubkey = secp256k1::PublicKey::from_slice(pubkey_bytes).map_err(|e| {
+                BtcBroadcastError::NodeRejected(format!("Input {} invalid pubkey: {}", i, e))
+            })?;
+
+            let der_bytes = &sig_bytes[..sig_bytes.len() - 1];
+            let sig = secp256k1::ecdsa::Signature::from_der(der_bytes).map_err(|e| {
+                BtcBroadcastError::NodeRejected(format!("Input {} invalid DER signature: {}", i, e))
+            })?;
+
+            let script_code = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::hash(pubkey_bytes));
+            let sighash = sighash_cache.p2wpkh_signature_hash(
+                i,
+                &script_code,
+                bitcoin::Amount::from_sat(val),
+                bitcoin::sighash::EcdsaSighashType::All,
+            ).map_err(|e| BtcBroadcastError::NodeRejected(format!("Failed to calculate BIP-143 sighash for input {}: {}", i, e)))?;
+
+            let msg = secp256k1::Message::from_digest(sighash.to_byte_array());
+            secp.verify_ecdsa(&msg, &sig, &pubkey).map_err(|e| {
+                BtcBroadcastError::NodeRejected(format!("Cryptographic signature verification failed for input {}: {}", i, e))
+            })?;
+        }
+
+        Ok(())
+    }
+
     /// Verifies that the raw transaction txid AND wtxid strictly match the approved draft before broadcasting
-    pub fn broadcast_verified(&self, raw_tx_hex: &str, expected_txid: &str, expected_wtxid: &str, network: BroadcastNetwork) -> Result<String, BtcBroadcastError> {
-        let (_tx, computed_txid, computed_wtxid) = self.dry_run_verify(raw_tx_hex, network)?;
+    pub fn broadcast_verified(
+        &self,
+        raw_tx_hex: &str,
+        expected_txid: &str,
+        expected_wtxid: &str,
+        expected_input_values: Option<&[u64]>,
+        network: BroadcastNetwork,
+    ) -> Result<String, BtcBroadcastError> {
+        let (tx, computed_txid, computed_wtxid) = self.dry_run_verify(raw_tx_hex, network)?;
         if computed_txid != expected_txid {
             return Err(BtcBroadcastError::NodeRejected(format!(
                 "Raw transaction txid '{}' does not match approved transaction txid '{}'",
@@ -258,6 +350,9 @@ impl EsploraBtcBroadcaster {
                 "Raw transaction wtxid '{}' does not match approved transaction wtxid '{}' (witness mismatch)",
                 computed_wtxid, expected_wtxid
             )));
+        }
+        if let Some(values) = expected_input_values {
+            self.verify_input_signatures(&tx, values)?;
         }
         self.broadcast(raw_tx_hex, network)
     }
@@ -308,9 +403,10 @@ impl BtcBroadcaster for EsploraBtcBroadcaster {
         raw_tx_hex: &str,
         expected_txid: &str,
         expected_wtxid: &str,
+        expected_input_values: Option<&[u64]>,
         network: BroadcastNetwork,
     ) -> Result<String, BtcBroadcastError> {
-        self.broadcast_verified(raw_tx_hex, expected_txid, expected_wtxid, network)
+        self.broadcast_verified(raw_tx_hex, expected_txid, expected_wtxid, expected_input_values, network)
     }
 
     fn query_status(&self, txid: &str, network: BroadcastNetwork) -> Result<BtcTxQueryStatus, BtcBroadcastError> {
