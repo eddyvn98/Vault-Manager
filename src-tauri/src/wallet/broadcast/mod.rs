@@ -14,6 +14,7 @@ mod tests {
     use crate::wallet::bip;
     use bitcoin::hashes::Hash;
     use std::str::FromStr;
+    use tiny_keccak::Hasher;
 
     #[test]
     fn test_mainnet_broadcast_strictly_forbidden() {
@@ -659,6 +660,10 @@ mod tests {
             vout: 0,
         };
 
+        let mut witness = bitcoin::Witness::new();
+        witness.push(vec![0x30, 0x44, 0x02, 0x20, 0x01]); // mock DER sig
+        witness.push(privkey.public_key(&secp).serialize());
+
         let tx = bitcoin::Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
@@ -666,7 +671,7 @@ mod tests {
                 previous_output: outpoint,
                 script_sig: bitcoin::ScriptBuf::new(),
                 sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
-                witness: bitcoin::Witness::new(),
+                witness,
             }],
             output: vec![bitcoin::TxOut {
                 value: bitcoin::Amount::from_sat(45_000),
@@ -676,15 +681,242 @@ mod tests {
 
         let raw_hex = hex::encode(bitcoin::consensus::serialize(&tx));
         let actual_txid = tx.compute_txid().to_string();
+        let actual_wtxid = tx.compute_wtxid().to_string();
 
-        // 1. With exact matching txid -> succeeds in dry run
-        let valid_res = btc_adapter.broadcast_verified(&raw_hex, &actual_txid, BroadcastNetwork::BitcoinSignet);
+        // 1. With exact matching txid and wtxid -> succeeds in dry run
+        let valid_res = btc_adapter.broadcast_verified(&raw_hex, &actual_txid, &actual_wtxid, BroadcastNetwork::BitcoinSignet);
         assert!(valid_res.is_ok());
 
         // 2. With altered / unexpected txid -> REJECTED
         let forged_txid = "000000000000000000000000000000000000000000000000000000000000dead";
-        let invalid_res = btc_adapter.broadcast_verified(&raw_hex, forged_txid, BroadcastNetwork::BitcoinSignet);
+        let invalid_res = btc_adapter.broadcast_verified(&raw_hex, forged_txid, &actual_wtxid, BroadcastNetwork::BitcoinSignet);
         assert!(invalid_res.is_err(), "Must reject raw tx if txid does not match approved draft");
         assert!(invalid_res.unwrap_err().to_string().contains("does not match approved transaction txid"));
+
+        // 3. With altered / forged wtxid (witness tampering) -> REJECTED
+        let forged_wtxid = "000000000000000000000000000000000000000000000000000000000000beef";
+        let invalid_wtxid_res = btc_adapter.broadcast_verified(&raw_hex, &actual_txid, forged_wtxid, BroadcastNetwork::BitcoinSignet);
+        assert!(invalid_wtxid_res.is_err(), "Must reject raw tx if wtxid does not match approved draft");
+        assert!(invalid_wtxid_res.unwrap_err().to_string().contains("witness mismatch"));
+
+        // 4. Raw tx with empty witness -> REJECTED by SegWit rule
+        let mut unsigned_tx = tx.clone();
+        unsigned_tx.input[0].witness = bitcoin::Witness::new();
+        let unsigned_hex = hex::encode(bitcoin::consensus::serialize(&unsigned_tx));
+        let unsigned_res = btc_adapter.broadcast_verified(&unsigned_hex, &actual_txid, &actual_wtxid, BroadcastNetwork::BitcoinSignet);
+        assert!(unsigned_res.is_err());
+        assert!(unsigned_res.unwrap_err().to_string().contains("lacks SegWit witness"));
+    }
+
+    #[test]
+    fn test_network_preflight_raw_verification() {
+        // BTC Preflight Verification:
+        let btc_adapter = EsploraBtcBroadcaster::new(false);
+        let secp_btc = bitcoin::secp256k1::Secp256k1::new();
+        let privkey_btc = bip::derive_bip84_privkey_at(
+            "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            bitcoin::Network::Signet,
+            0,
+            0,
+        ).unwrap();
+        let script_btc = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::hash(&privkey_btc.public_key(&secp_btc).serialize()));
+
+        let outpoint = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_str("0000000000000000000000000000000000000000000000000000000000000002").unwrap(),
+            vout: 0,
+        };
+
+        let mut witness = bitcoin::Witness::new();
+        witness.push(vec![0x30, 0x44, 0x02, 0x20, 0xaa]); // signature
+        witness.push(privkey_btc.public_key(&secp_btc).serialize());
+
+        let valid_btc_tx = bitcoin::Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![bitcoin::TxIn {
+                previous_output: outpoint,
+                script_sig: bitcoin::ScriptBuf::new(),
+                sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness,
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(50_000),
+                script_pubkey: script_btc,
+            }],
+        };
+        let btc_raw_hex = hex::encode(bitcoin::consensus::serialize(&valid_btc_tx));
+        let expected_txid = valid_btc_tx.compute_txid().to_string();
+        let expected_wtxid = valid_btc_tx.compute_wtxid().to_string();
+
+        // BTC: Valid match succeeds
+        assert!(btc_adapter.broadcast_verified(&btc_raw_hex, &expected_txid, &expected_wtxid, BroadcastNetwork::BitcoinSignet).is_ok());
+        // BTC: Wrong network rejected
+        assert!(btc_adapter.broadcast_verified(&btc_raw_hex, &expected_txid, &expected_wtxid, BroadcastNetwork::BscTestnet).is_err());
+
+        // BSC Preflight Verification:
+        let bsc_adapter = RpcBscBroadcaster::new(false);
+        let secp_bsc = secp256k1::Secp256k1::new();
+        let privkey_bsc = secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let pubkey_bsc = secp256k1::PublicKey::from_secret_key(&secp_bsc, &privkey_bsc);
+        let uncompressed = pubkey_bsc.serialize_uncompressed();
+        let mut hasher = tiny_keccak::Keccak::v256();
+        let mut addr_hash = [0u8; 32];
+        hasher.update(&uncompressed[1..]);
+        hasher.finalize(&mut addr_hash);
+        let expected_sender = crate::wallet::tx::policy::to_eip55_checksum(&hex::encode(&addr_hash[12..32]));
+
+        let recipient_str = "0x9858EfFD232B4033E47d90003D41EC34EcaEda94";
+        let amount_raw_str = "2500000000000000000"; // 2.5 USDT
+        let calldata = crate::wallet::tx::bsc::calldata::encode_erc20_transfer(
+            recipient_str,
+            &num_bigint::BigUint::from(2500000000000000000u64),
+        ).unwrap();
+
+        let bsc_tx = crate::wallet::signer::bsc::Eip155Transaction {
+            nonce: 5,
+            gas_price: num_bigint::BigUint::from(3_000_000_000u64),
+            gas_limit: 65_000,
+            to: crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT.to_string(),
+            value: num_bigint::BigUint::from(0u32),
+            data: hex::decode(calldata.trim_start_matches("0x")).unwrap(),
+            chain_id: 97, // BSC Testnet
+        };
+        let signed_bsc = bsc_tx.sign(&secp_bsc, &privkey_bsc).unwrap();
+        let bsc_raw_hex = hex::encode(&signed_bsc.raw_signed_tx_bytes);
+
+        // BSC 1: Valid signed payload matches sender, recipient, amount -> PASS
+        let verify_ok = bsc_adapter.dry_run_verify_against_draft(
+            &bsc_raw_hex,
+            Some(&expected_sender),
+            Some(recipient_str),
+            Some(amount_raw_str),
+            BroadcastNetwork::BscTestnet,
+        );
+        assert!(verify_ok.is_ok(), "BSC preflight valid draft must succeed: {:?}", verify_ok);
+
+        // BSC 2: Forged recipient -> REJECTED
+        let forged_recip = "0x1111111111111111111111111111111111111111";
+        let recip_fail = bsc_adapter.dry_run_verify_against_draft(
+            &bsc_raw_hex,
+            Some(&expected_sender),
+            Some(forged_recip),
+            Some(amount_raw_str),
+            BroadcastNetwork::BscTestnet,
+        );
+        assert!(recip_fail.is_err(), "Must reject forged recipient");
+        assert!(recip_fail.unwrap_err().to_string().contains("recipient"));
+
+        // BSC 3: Forged amount -> REJECTED
+        let forged_amount = "9999999999999999999";
+        let amount_fail = bsc_adapter.dry_run_verify_against_draft(
+            &bsc_raw_hex,
+            Some(&expected_sender),
+            Some(recipient_str),
+            Some(forged_amount),
+            BroadcastNetwork::BscTestnet,
+        );
+        assert!(amount_fail.is_err(), "Must reject forged amount");
+        assert!(amount_fail.unwrap_err().to_string().contains("amount"));
+
+        // BSC 4: Forged sender -> REJECTED
+        let forged_sender = "0x2222222222222222222222222222222222222222";
+        let sender_fail = bsc_adapter.dry_run_verify_against_draft(
+            &bsc_raw_hex,
+            Some(forged_sender),
+            Some(recipient_str),
+            Some(amount_raw_str),
+            BroadcastNetwork::BscTestnet,
+        );
+        assert!(sender_fail.is_err(), "Must reject forged sender");
+        assert!(sender_fail.unwrap_err().to_string().contains("sender"));
+
+        // BSC 5: Trailing garbage bytes appended -> REJECTED by strict RLP consumption check
+        let trailing_garbage_hex = format!("{}deadbeef", bsc_raw_hex);
+        let trailing_fail = bsc_adapter.dry_run_verify_against_draft(
+            &trailing_garbage_hex,
+            Some(&expected_sender),
+            Some(recipient_str),
+            Some(amount_raw_str),
+            BroadcastNetwork::BscTestnet,
+        );
+        assert!(trailing_fail.is_err(), "Must reject trailing garbage bytes");
+        assert!(trailing_fail.unwrap_err().to_string().contains("trailing"));
+    }
+
+    #[test]
+    fn test_crash_safe_broadcaster_auto_persist() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let persist_file = temp_dir.path().join("crash_safe_lifecycle.json");
+
+        let mut coordinator = TxLifecycleCoordinator::new();
+        coordinator.set_storage_path(persist_file.clone());
+
+        let draft_id = "draft_crash_safety_btc_01";
+        coordinator.register_draft(draft_id, BroadcastNetwork::BitcoinSignet, 2000).unwrap();
+
+        let raw_tx = "0200000001deadbeef0000000000";
+        let payload_hash = "0xhash_auto_persist_test";
+        coordinator.record_signed(draft_id, payload_hash, raw_tx, 2005).unwrap();
+
+        // Broadcaster mock configured to fail on broadcast with timeout
+        let broadcaster = MockBtcBroadcaster::new();
+        broadcaster.next_broadcast_result.lock().unwrap().replace(Err(BtcBroadcastError::Timeout("Connection timeout".into())));
+
+        // Execute broadcast (which will retry once and fail)
+        let broadcast_res = coordinator.execute_broadcast_btc(draft_id, &broadcaster, 1, 2010);
+        assert!(broadcast_res.is_err());
+
+        // CRITICAL CHECK: Auto-persist file on disk must exist WITHOUT having manually called save_to_file!
+        assert!(persist_file.exists(), "Coordinator must auto-persist state before and after network I/O");
+
+        // Simulate application crash and restart by dropping coordinator and loading fresh instance from file
+        drop(coordinator);
+        let restored_coordinator = TxLifecycleCoordinator::load_from_file(&persist_file).unwrap();
+        let restored_rec = restored_coordinator.get_record(draft_id).unwrap();
+
+        // Verify that raw_tx_hex and payload_hash were preserved across the crash
+        assert_eq!(restored_rec.raw_tx_hex.as_deref(), Some(raw_tx));
+        assert_eq!(restored_rec.payload_hash.as_deref(), Some(payload_hash));
+        assert!(matches!(restored_rec.status, TxLifecycleStatus::Failed { permanent: false, .. }));
+    }
+
+    #[test]
+    fn test_sqlite_reset_with_open_connection_safety() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let bdk_db_dir = temp_dir.path().join("bdk_signet_db");
+        std::fs::create_dir_all(&bdk_db_dir).unwrap();
+        let db_file = bdk_db_dir.join("bdk_signet.sqlite3");
+        std::fs::write(&db_file, b"sample bdk sqlite database").unwrap();
+
+        let tracker = std::sync::Arc::new(crate::wallet::SqliteTracker::default());
+
+        // 1. Simulate an active connection open by acquiring a connection guard
+        let conn_guard = tracker.acquire_connection().expect("Must acquire connection");
+        assert_eq!(tracker.active_connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        // 2. Attempting to begin reset while connection is active MUST fail safely
+        let reset_attempt = tracker.begin_reset();
+        assert!(reset_attempt.is_err(), "Reset must fail safely when SQLite connection is open");
+        assert!(reset_attempt.unwrap_err().contains("active SQLite database connection(s) still open"));
+
+        // Ensure database files were NOT deleted or corrupted
+        assert!(db_file.exists(), "Database file must remain intact after aborted reset");
+
+        // 3. Close the connection by dropping the guard
+        drop(conn_guard);
+        assert_eq!(tracker.active_connections.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // 4. Now begin_reset succeeds
+        assert!(tracker.begin_reset().is_ok());
+
+        // 5. Execute cleanup_sqlite_files
+        let cleanup_res = crate::wallet::cleanup_sqlite_files(temp_dir.path());
+        assert!(cleanup_res.is_ok(), "Cleanup must succeed after connections closed: {:?}", cleanup_res);
+
+        // Verify complete purge
+        assert!(!bdk_db_dir.exists(), "Database directory must be purged");
+        assert!(!db_file.exists(), "Database file must be purged");
+
+        tracker.finish_reset();
     }
 }

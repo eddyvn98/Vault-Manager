@@ -16,6 +16,7 @@ struct LifecycleSnapshot {
 pub struct TxLifecycleCoordinator {
     records: HashMap<String, TxLifecycleRecord>,
     confirmed_block_hashes: HashMap<String, (u64, String)>, // tx_hash -> (block_height, block_hash)
+    pub storage_path: Option<std::path::PathBuf>,
 }
 
 #[allow(dead_code)]
@@ -24,6 +25,7 @@ impl Default for TxLifecycleCoordinator {
         Self {
             records: HashMap::new(),
             confirmed_block_hashes: HashMap::new(),
+            storage_path: None,
         }
     }
 }
@@ -32,6 +34,17 @@ impl Default for TxLifecycleCoordinator {
 impl TxLifecycleCoordinator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn set_storage_path(&mut self, path: std::path::PathBuf) {
+        self.storage_path = Some(path);
+    }
+
+    pub fn persist_if_configured(&self) -> Result<(), String> {
+        if let Some(path) = &self.storage_path {
+            self.save_to_file(path)?;
+        }
+        Ok(())
     }
 
     pub fn get_record(&self, id: &str) -> Option<&TxLifecycleRecord> {
@@ -77,7 +90,9 @@ impl TxLifecycleCoordinator {
     #[allow(dead_code)]
     pub fn load_from_file(path: &std::path::Path) -> Result<Self, String> {
         if !path.exists() {
-            return Ok(Self::new());
+            let mut coord = Self::new();
+            coord.storage_path = Some(path.to_path_buf());
+            return Ok(coord);
         }
         let data = std::fs::read(path)
             .map_err(|e| format!("Cannot read lifecycle file: {}", e))?;
@@ -85,11 +100,29 @@ impl TxLifecycleCoordinator {
             .map_err(|e| format!("Cannot parse lifecycle file: {}", e))?;
 
         let mut coordinator = Self::new();
+        coordinator.storage_path = Some(path.to_path_buf());
         for r in snapshot.records {
             coordinator.records.insert(r.record_id.clone(), r);
         }
         coordinator.confirmed_block_hashes = snapshot.confirmed_block_hashes;
         Ok(coordinator)
+    }
+
+    pub fn transition_record_and_persist(
+        &mut self,
+        draft_id: &str,
+        next_status: TxLifecycleStatus,
+        now_unix: u64,
+    ) -> Result<(), String> {
+        {
+            let record = self
+                .records
+                .get_mut(draft_id)
+                .ok_or_else(|| format!("Draft '{}' not found", draft_id))?;
+            record.transition_to(next_status, now_unix)?;
+        }
+        self.persist_if_configured()?;
+        Ok(())
     }
 
     pub fn register_draft(
@@ -103,6 +136,7 @@ impl TxLifecycleCoordinator {
         }
         let record = TxLifecycleRecord::new(draft_id.to_string(), network, now_unix);
         self.records.insert(draft_id.to_string(), record);
+        let _ = self.persist_if_configured();
         Ok(())
     }
 
@@ -113,18 +147,64 @@ impl TxLifecycleCoordinator {
         raw_tx_hex: &str,
         now_unix: u64,
     ) -> Result<(), String> {
-        let record = self
-            .records
-            .get_mut(draft_id)
-            .ok_or_else(|| format!("Draft '{}' not found", draft_id))?;
-
         let signed_status = TxLifecycleStatus::Signed {
             draft_id: draft_id.to_string(),
             payload_hash: payload_hash.to_string(),
             raw_tx_hex: raw_tx_hex.to_string(),
         };
+        self.transition_record_and_persist(draft_id, signed_status, now_unix)
+    }
 
-        record.transition_to(signed_status, now_unix)
+    pub fn record_signed_btc(
+        &mut self,
+        draft_id: &str,
+        payload_hash: &str,
+        raw_tx_hex: &str,
+        txid: &str,
+        wtxid: &str,
+        now_unix: u64,
+    ) -> Result<(), String> {
+        {
+            let record = self
+                .records
+                .get_mut(draft_id)
+                .ok_or_else(|| format!("Draft '{}' not found", draft_id))?;
+            record.expected_txid = Some(txid.to_string());
+            record.expected_wtxid = Some(wtxid.to_string());
+        }
+        let signed_status = TxLifecycleStatus::Signed {
+            draft_id: draft_id.to_string(),
+            payload_hash: payload_hash.to_string(),
+            raw_tx_hex: raw_tx_hex.to_string(),
+        };
+        self.transition_record_and_persist(draft_id, signed_status, now_unix)
+    }
+
+    pub fn record_signed_bsc(
+        &mut self,
+        draft_id: &str,
+        payload_hash: &str,
+        raw_tx_hex: &str,
+        sender: &str,
+        recipient: &str,
+        amount_raw: &str,
+        now_unix: u64,
+    ) -> Result<(), String> {
+        {
+            let record = self
+                .records
+                .get_mut(draft_id)
+                .ok_or_else(|| format!("Draft '{}' not found", draft_id))?;
+            record.expected_sender = Some(sender.to_string());
+            record.expected_recipient = Some(recipient.to_string());
+            record.expected_amount_raw = Some(amount_raw.to_string());
+        }
+        let signed_status = TxLifecycleStatus::Signed {
+            draft_id: draft_id.to_string(),
+            payload_hash: payload_hash.to_string(),
+            raw_tx_hex: raw_tx_hex.to_string(),
+        };
+        self.transition_record_and_persist(draft_id, signed_status, now_unix)
     }
 
     pub fn execute_broadcast_btc(
@@ -134,26 +214,29 @@ impl TxLifecycleCoordinator {
         max_retries: u32,
         now_unix: u64,
     ) -> Result<String, String> {
-        let record = self
-            .records
-            .get_mut(draft_id)
-            .ok_or_else(|| format!("Draft '{}' not found", draft_id))?;
+        let (raw_hex, expected_txid, expected_wtxid, network) = {
+            let record = self
+                .records
+                .get(draft_id)
+                .ok_or_else(|| format!("Draft '{}' not found", draft_id))?;
 
-        if record.network != BroadcastNetwork::BitcoinSignet {
-            return Err("BTC broadcast requested for non-Bitcoin network".to_string());
-        }
+            if record.network != BroadcastNetwork::BitcoinSignet {
+                return Err("BTC broadcast requested for non-Bitcoin network".to_string());
+            }
 
-        let raw_hex = match &record.status {
-            TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
-            TxLifecycleStatus::Broadcasting { .. } => {
-                record.raw_tx_hex.clone().ok_or_else(|| "Missing raw_tx_hex in record".to_string())?
-            }
-            other => {
-                return Err(format!(
-                    "Cannot broadcast transaction in state '{:?}', must be Signed or Broadcasting",
-                    other
-                ))
-            }
+            let raw = match &record.status {
+                TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
+                TxLifecycleStatus::Broadcasting { .. } => {
+                    record.raw_tx_hex.clone().ok_or_else(|| "Missing raw_tx_hex in record".to_string())?
+                }
+                other => {
+                    return Err(format!(
+                        "Cannot broadcast transaction in state '{:?}', must be Signed or Broadcasting",
+                        other
+                    ))
+                }
+            };
+            (raw, record.expected_txid.clone(), record.expected_wtxid.clone(), record.network)
         };
 
         let mut attempt = 0u32;
@@ -163,15 +246,22 @@ impl TxLifecycleCoordinator {
                 draft_id: draft_id.to_string(),
                 attempt,
             };
-            record.transition_to(broadcasting_status, now_unix)?;
+            // AUTO-PERSIST BEFORE NETWORK I/O (P1 Hardening)
+            self.transition_record_and_persist(draft_id, broadcasting_status, now_unix)?;
 
-            match broadcaster.broadcast(&raw_hex, record.network) {
+            let broadcast_res = if let (Some(txid), Some(wtxid)) = (&expected_txid, &expected_wtxid) {
+                broadcaster.broadcast_verified(&raw_hex, txid, wtxid, network)
+            } else {
+                broadcaster.broadcast(&raw_hex, network)
+            };
+
+            match broadcast_res {
                 Ok(txid) => {
                     let pending_status = TxLifecycleStatus::Pending {
                         tx_hash: txid.clone(),
                         first_seen_unix: now_unix,
                     };
-                    record.transition_to(pending_status, now_unix)?;
+                    self.transition_record_and_persist(draft_id, pending_status, now_unix)?;
                     return Ok(txid);
                 }
                 Err(err) => {
@@ -191,7 +281,7 @@ impl TxLifecycleCoordinator {
                         error_message: err.to_string(),
                         permanent,
                     };
-                    record.transition_to(failed_status, now_unix)?;
+                    self.transition_record_and_persist(draft_id, failed_status, now_unix)?;
                     return Err(format!("BTC broadcast failed: {}", err));
                 }
             }
@@ -205,26 +295,35 @@ impl TxLifecycleCoordinator {
         max_retries: u32,
         now_unix: u64,
     ) -> Result<String, String> {
-        let record = self
-            .records
-            .get_mut(draft_id)
-            .ok_or_else(|| format!("Draft '{}' not found", draft_id))?;
+        let (raw_hex, expected_sender, expected_recipient, expected_amount_raw, network) = {
+            let record = self
+                .records
+                .get(draft_id)
+                .ok_or_else(|| format!("Draft '{}' not found", draft_id))?;
 
-        if record.network != BroadcastNetwork::BscTestnet {
-            return Err("BSC broadcast requested for non-BSC network".to_string());
-        }
+            if record.network != BroadcastNetwork::BscTestnet {
+                return Err("BSC broadcast requested for non-BSC network".to_string());
+            }
 
-        let raw_hex = match &record.status {
-            TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
-            TxLifecycleStatus::Broadcasting { .. } => {
-                record.raw_tx_hex.clone().ok_or_else(|| "Missing raw_tx_hex in record".to_string())?
-            }
-            other => {
-                return Err(format!(
-                    "Cannot broadcast transaction in state '{:?}', must be Signed or Broadcasting",
-                    other
-                ))
-            }
+            let raw = match &record.status {
+                TxLifecycleStatus::Signed { raw_tx_hex, .. } => raw_tx_hex.clone(),
+                TxLifecycleStatus::Broadcasting { .. } => {
+                    record.raw_tx_hex.clone().ok_or_else(|| "Missing raw_tx_hex in record".to_string())?
+                }
+                other => {
+                    return Err(format!(
+                        "Cannot broadcast transaction in state '{:?}', must be Signed or Broadcasting",
+                        other
+                    ))
+                }
+            };
+            (
+                raw,
+                record.expected_sender.clone(),
+                record.expected_recipient.clone(),
+                record.expected_amount_raw.clone(),
+                record.network,
+            )
         };
 
         let mut attempt = 0u32;
@@ -234,15 +333,24 @@ impl TxLifecycleCoordinator {
                 draft_id: draft_id.to_string(),
                 attempt,
             };
-            record.transition_to(broadcasting_status, now_unix)?;
+            // AUTO-PERSIST BEFORE NETWORK I/O (P1 Hardening)
+            self.transition_record_and_persist(draft_id, broadcasting_status, now_unix)?;
 
-            match broadcaster.broadcast(&raw_hex, record.network) {
+            let broadcast_res = broadcaster.broadcast_verified(
+                &raw_hex,
+                expected_sender.as_deref(),
+                expected_recipient.as_deref(),
+                expected_amount_raw.as_deref(),
+                network,
+            );
+
+            match broadcast_res {
                 Ok(tx_hash) => {
                     let pending_status = TxLifecycleStatus::Pending {
                         tx_hash: tx_hash.clone(),
                         first_seen_unix: now_unix,
                     };
-                    record.transition_to(pending_status, now_unix)?;
+                    self.transition_record_and_persist(draft_id, pending_status, now_unix)?;
                     return Ok(tx_hash);
                 }
                 Err(err) => {
@@ -261,7 +369,7 @@ impl TxLifecycleCoordinator {
                         error_message: err.to_string(),
                         permanent,
                     };
-                    record.transition_to(failed_status, now_unix)?;
+                    self.transition_record_and_persist(draft_id, failed_status, now_unix)?;
                     return Err(format!("BSC broadcast failed: {}", err));
                 }
             }

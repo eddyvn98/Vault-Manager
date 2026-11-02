@@ -92,14 +92,15 @@ pub fn compute_btc_payload_hash(unsigned_psbt_base64: &str) -> String {
 /// Binds draft verification directly to BTC signing:
 /// Decodes the PSBT directly from the approved unsigned_psbt_base64 string,
 /// validates against approved policy, derives each input's key using approved.change and derivation_index,
-/// finalizes the PSBT, extracts the raw signed transaction, and returns (fee_sat, raw_tx_hex).
+/// finalizes the PSBT, extracts the raw signed transaction with witnesses, computes txid and wtxid,
+/// and returns VerifiedSignedBtcDraft.
 #[allow(dead_code)]
 pub fn sign_verified_btc_draft(
     session: &mut SessionState,
     draft_id: &str,
     unsigned_psbt_base64: &str,
     policy: &signer::btc::BtcSigningPolicy,
-) -> Result<(u64, String), String> {
+) -> Result<VerifiedSignedBtcDraft, String> {
     use base64::Engine;
 
     let payload_hash = compute_btc_payload_hash(unsigned_psbt_base64);
@@ -161,8 +162,16 @@ pub fn sign_verified_btc_draft(
         .map_err(|e| format!("Cannot extract final signed transaction from PSBT: {:?}", e))?;
     let raw_tx_bytes = bitcoin::consensus::serialize(&extracted_tx);
     let raw_tx_hex = hex::encode(raw_tx_bytes);
+    let txid = extracted_tx.compute_txid().to_string();
+    let wtxid = extracted_tx.compute_wtxid().to_string();
 
-    Ok((fee, raw_tx_hex))
+    Ok(VerifiedSignedBtcDraft {
+        fee_sat: fee,
+        raw_tx_hex,
+        txid,
+        wtxid,
+        payload_hash,
+    })
 }
 
 /// Binds draft verification directly to BSC signing:
@@ -203,9 +212,82 @@ pub fn sign_verified_bsc_draft(
     Ok(signed)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedSignedBtcDraft {
+    pub fee_sat: u64,
+    pub raw_tx_hex: String,
+    pub txid: String,
+    pub wtxid: String,
+    pub payload_hash: String,
+}
+
+pub struct SqliteTracker {
+    pub active_connections: std::sync::atomic::AtomicUsize,
+    pub is_locked_for_reset: std::sync::atomic::AtomicBool,
+}
+
+impl Default for SqliteTracker {
+    fn default() -> Self {
+        Self {
+            active_connections: std::sync::atomic::AtomicUsize::new(0),
+            is_locked_for_reset: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
+
+pub struct SqliteConnGuard {
+    tracker: std::sync::Arc<SqliteTracker>,
+}
+
+impl Drop for SqliteConnGuard {
+    fn drop(&mut self) {
+        self.tracker.active_connections.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl SqliteTracker {
+    pub fn acquire_connection(self: &std::sync::Arc<Self>) -> Result<SqliteConnGuard, String> {
+        if self.is_locked_for_reset.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err("SQLite database access denied: reset/purge operation is in progress".to_string());
+        }
+        self.active_connections.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(SqliteConnGuard {
+            tracker: std::sync::Arc::clone(self),
+        })
+    }
+
+    pub fn begin_reset(&self) -> Result<(), String> {
+        self.is_locked_for_reset.store(true, std::sync::atomic::Ordering::SeqCst);
+
+        // Give in-flight queries a short graceful window (100ms) to drop
+        for _ in 0..10 {
+            if self.active_connections.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let active = self.active_connections.load(std::sync::atomic::Ordering::SeqCst);
+        if active > 0 {
+            self.is_locked_for_reset.store(false, std::sync::atomic::Ordering::SeqCst);
+            return Err(format!(
+                "Cannot reset wallet: {} active SQLite database connection(s) still open. Reset aborted safely.",
+                active
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn finish_reset(&self) {
+        self.is_locked_for_reset.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 pub struct WalletSession {
     pub session: Mutex<SessionState>,
     pub is_preparing: std::sync::atomic::AtomicBool,
+    pub sqlite_tracker: std::sync::Arc<SqliteTracker>,
 }
 
 impl Default for WalletSession {
@@ -213,6 +295,7 @@ impl Default for WalletSession {
         Self {
             session: Mutex::new(SessionState::default()),
             is_preparing: std::sync::atomic::AtomicBool::new(false),
+            sqlite_tracker: std::sync::Arc::new(SqliteTracker::default()),
         }
     }
 }
@@ -569,6 +652,7 @@ pub async fn prepare_btc_transaction(
     let _ = fs::create_dir_all(&db_dir);
     let db_path = db_dir.join("bdk_signet.sqlite3");
 
+    let _conn_guard = state.sqlite_tracker.acquire_connection()?;
     let preview =
         tx::btc::prepare::prepare_signet_tx(&mnemonic, &recipient, amount_satoshis, fee_rate_sat_vb, Some(&db_path))
             .await?;
@@ -693,7 +777,7 @@ pub fn cleanup_sqlite_files(app_dir: &std::path::Path) -> Result<(), String> {
             .map_err(|e| format!("Cannot purge staged SQLite database directory: {}", e))?;
     }
 
-    // 3. Fallback: Also clean up any legacy loose database/journal files
+    // 3. Fallback: Also clean up any legacy loose database/journal files with strict error checking
     let bdk_db = app_dir.join("bdk_signet.sqlite3");
     let bdk_wal = app_dir.join("bdk_signet.sqlite3-wal");
     let bdk_shm = app_dir.join("bdk_signet.sqlite3-shm");
@@ -701,24 +785,34 @@ pub fn cleanup_sqlite_files(app_dir: &std::path::Path) -> Result<(), String> {
     if bdk_db.exists() || bdk_wal.exists() || bdk_shm.exists() {
         let now = LockoutManager::now_unix();
         let staging_dir = app_dir.join(format!(".sqlite_staging_loose_{}", now));
-        let _ = fs::create_dir_all(&staging_dir);
+        fs::create_dir_all(&staging_dir)
+            .map_err(|e| format!("Cannot create loose staging dir: {}", e))?;
         if bdk_db.exists() {
-            let _ = fs::rename(&bdk_db, staging_dir.join("bdk_signet.sqlite3"));
+            fs::rename(&bdk_db, staging_dir.join("bdk_signet.sqlite3"))
+                .map_err(|e| format!("Cannot stage bdk_signet.sqlite3: {}", e))?;
         }
         if bdk_wal.exists() {
-            let _ = fs::rename(&bdk_wal, staging_dir.join("bdk_signet.sqlite3-wal"));
+            fs::rename(&bdk_wal, staging_dir.join("bdk_signet.sqlite3-wal"))
+                .map_err(|e| format!("Cannot stage bdk_signet.sqlite3-wal: {}", e))?;
         }
         if bdk_shm.exists() {
-            let _ = fs::rename(&bdk_shm, staging_dir.join("bdk_signet.sqlite3-shm"));
+            fs::rename(&bdk_shm, staging_dir.join("bdk_signet.sqlite3-shm"))
+                .map_err(|e| format!("Cannot stage bdk_signet.sqlite3-shm: {}", e))?;
         }
-        let _ = fs::remove_dir_all(&staging_dir);
+        fs::remove_dir_all(&staging_dir)
+            .map_err(|e| format!("Cannot purge loose staging dir: {}", e))?;
+    }
+
+    // 4. Strict post-cleanup verification: database files must no longer exist
+    if bdk_db_dir.exists() || bdk_db.exists() || bdk_wal.exists() || bdk_shm.exists() {
+        return Err("SQLite cleanup verification failed: database files still present on disk".to_string());
     }
 
     Ok(())
 }
 
 /// Secure reset: Requires valid password verification to authenticate the owner before deleting.
-/// Clean up SQLite storage FIRST before touching encrypted vault file, ensuring atomic reset.
+/// Coordinates SQLite connection shutdown, stages and cleans SQLite storage FIRST before touching vault file.
 #[tauri::command]
 pub fn reset_wallet(
     app: AppHandle,
@@ -760,13 +854,26 @@ pub fn reset_wallet(
         session.session_epoch = session.session_epoch.wrapping_add(1);
     }
 
-    // 2. Clean up SQLite database and journals FIRST
-    if let Ok(app_dir) = app.path().app_data_dir() {
-        cleanup_sqlite_files(&app_dir)?;
+    // 2. Coordinate SQLite shutdown: lock new connections and ensure active connections are closed
+    state.sqlite_tracker.begin_reset()?;
+
+    // 3. Clean up SQLite database and journals FIRST
+    let cleanup_res = if let Ok(app_dir) = app.path().app_data_dir() {
+        cleanup_sqlite_files(&app_dir)
+    } else {
+        Ok(())
+    };
+
+    if let Err(e) = cleanup_res {
+        state.sqlite_tracker.finish_reset();
+        return Err(e);
     }
 
-    // 3. Only after SQLite cleanup succeeds, remove the vault file
-    fs::remove_file(&file).map_err(|e| format!("Cannot remove vault file: {}", e))?;
+    // 4. Only after SQLite cleanup succeeds, remove the vault file
+    let rm_vault_res = fs::remove_file(&file);
+    state.sqlite_tracker.finish_reset();
+
+    rm_vault_res.map_err(|e| format!("Cannot remove vault file: {}", e))?;
     mgr.record_success();
 
     Ok(())
@@ -1143,12 +1250,14 @@ mod tests {
         };
 
         // Execute unified draft-bound signing
-        let (fee, raw_tx_hex) = sign_verified_btc_draft(
+        let signed_draft = sign_verified_btc_draft(
             &mut session,
             draft_id,
             &unsigned_psbt_base64,
             &policy,
         ).expect("End-to-end BTC signing must succeed");
+        let fee = signed_draft.fee_sat;
+        let raw_tx_hex = signed_draft.raw_tx_hex;
 
         assert_eq!(fee, 3000, "Fee must be 50k + 30k - 60k - 17k = 3000 sats");
         assert!(session.active_draft.is_none(), "Active draft must be consumed");

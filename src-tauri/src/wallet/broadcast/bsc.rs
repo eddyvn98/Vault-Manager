@@ -1,4 +1,6 @@
 use crate::wallet::broadcast::types::BroadcastNetwork;
+use num_bigint::BigUint;
+use num_traits::Zero;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 use tiny_keccak::{Hasher, Keccak};
@@ -107,6 +109,14 @@ pub fn parse_bsc_rpc_error(code: i64, message: &str) -> BscBroadcastError {
 #[allow(dead_code)]
 pub trait BscBroadcaster: Send + Sync {
     fn broadcast(&self, raw_signed_hex: &str, network: BroadcastNetwork) -> Result<String, BscBroadcastError>;
+    fn broadcast_verified(
+        &self,
+        raw_signed_hex: &str,
+        expected_sender: Option<&str>,
+        expected_recipient: Option<&str>,
+        expected_amount_raw: Option<&str>,
+        network: BroadcastNetwork,
+    ) -> Result<String, BscBroadcastError>;
     fn query_receipt(&self, tx_hash: &str, network: BroadcastNetwork) -> Result<BscReceiptStatus, BscBroadcastError>;
 }
 
@@ -172,6 +182,17 @@ impl BscBroadcaster for MockBscBroadcaster {
         Ok(format!("0x{}", hex::encode(hash)))
     }
 
+    fn broadcast_verified(
+        &self,
+        raw_signed_hex: &str,
+        _expected_sender: Option<&str>,
+        _expected_recipient: Option<&str>,
+        _expected_amount_raw: Option<&str>,
+        network: BroadcastNetwork,
+    ) -> Result<String, BscBroadcastError> {
+        self.broadcast(raw_signed_hex, network)
+    }
+
     fn query_receipt(&self, tx_hash: &str, network: BroadcastNetwork) -> Result<BscReceiptStatus, BscBroadcastError> {
         if network != BroadcastNetwork::BscTestnet {
             return Err(BscBroadcastError::NetworkForbidden(
@@ -192,7 +213,7 @@ pub fn parse_rlp_list(payload: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     }
 
     let first = payload[0];
-    let (list_payload, _consumed) = if (0xc0..=0xf7).contains(&first) {
+    let (list_payload, consumed) = if (0xc0..=0xf7).contains(&first) {
         let len = (first - 0xc0) as usize;
         if payload.len() < 1 + len {
             return Err("RLP list payload truncated".into());
@@ -214,6 +235,14 @@ pub fn parse_rlp_list(payload: &[u8]) -> Result<Vec<Vec<u8>>, String> {
     } else {
         return Err("Expected RLP list header (0xc0..0xff)".into());
     };
+
+    if consumed != payload.len() {
+        return Err(format!(
+            "RLP list has trailing unparsed bytes: consumed {} of {} bytes",
+            consumed,
+            payload.len()
+        ));
+    }
 
     let mut items = Vec::new();
     let mut cursor = 0;
@@ -282,10 +311,18 @@ impl RpcBscBroadcaster {
         }
     }
 
-    /// Dry-run verification (G5A): Decodes RLP, parses EIP-155 signature fields,
-    /// verifies chain ID 97, recipient contract, zero value, and ERC-20 selector,
+    /// Dry-run verification against draft: Decodes RLP, parses EIP-155 fields,
+    /// verifies chain ID 97, recipient contract, zero value, ERC-20 selector & parameters,
+    /// cryptographically recovers signer address via secp256k1, matches approved draft params,
     /// and calculates Keccak-256 hash without sending eth_sendRawTransaction.
-    pub fn dry_run_verify(&self, raw_tx_hex: &str, network: BroadcastNetwork) -> Result<String, BscBroadcastError> {
+    pub fn dry_run_verify_against_draft(
+        &self,
+        raw_tx_hex: &str,
+        expected_sender: Option<&str>,
+        expected_recipient: Option<&str>,
+        expected_amount_raw: Option<&str>,
+        network: BroadcastNetwork,
+    ) -> Result<String, BscBroadcastError> {
         if network != BroadcastNetwork::BscTestnet {
             return Err(BscBroadcastError::NetworkForbidden(
                 format!("Network {:?} is strictly forbidden. Only BSC Testnet (Chain ID 97) is permitted.", network)
@@ -300,18 +337,78 @@ impl RpcBscBroadcaster {
             return Err(BscBroadcastError::RpcError { code: -32602, message: "Raw transaction bytes are empty".to_string() });
         }
 
-        // Parse RLP items
+        // 1. Parse RLP items and ensure entire byte slice is consumed (no trailing bytes)
         let items = parse_rlp_list(&raw_bytes)
             .map_err(|e| BscBroadcastError::RpcError { code: -32602, message: format!("Failed to parse EIP-155 RLP list: {}", e) })?;
 
         if items.len() != 9 {
             return Err(BscBroadcastError::RpcError {
                 code: -32602,
-                message: format!("Expected 9 RLP items for EIP-155 transaction, got {}", items.len()),
+                message: format!("Expected exactly 9 RLP items for EIP-155 transaction, got {}", items.len()),
             });
         }
 
-        // Item 6: v (must decode to chain_id = 97)
+        // 2. Parse Nonce (item 0)
+        let mut nonce = 0u64;
+        for &b in &items[0] {
+            nonce = (nonce << 8) | (b as u64);
+        }
+
+        // 3. Parse Gas Price (item 1)
+        let gas_price = BigUint::from_bytes_be(&items[1]);
+
+        // 4. Parse Gas Limit (item 2)
+        let mut gas_limit = 0u64;
+        for &b in &items[2] {
+            gas_limit = (gas_limit << 8) | (b as u64);
+        }
+
+        // 5. Parse 'to' address (item 3: must be 20 bytes and match BSC Testnet USDT contract)
+        if items[3].len() != 20 {
+            return Err(BscBroadcastError::RpcError {
+                code: -32602,
+                message: format!("Recipient 'to' field must be exactly 20 bytes, got {}", items[3].len()),
+            });
+        }
+        let to_addr = crate::wallet::tx::policy::to_eip55_checksum(&hex::encode(&items[3]));
+        if to_addr.to_lowercase() != crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT.to_lowercase() {
+            return Err(BscBroadcastError::NetworkForbidden(
+                format!("Unauthorized recipient contract: expected {}, got {}", crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT, to_addr),
+            ));
+        }
+
+        // 6. Parse Value (item 4: must be strictly 0 for token transfers)
+        let value = BigUint::from_bytes_be(&items[4]);
+        if !value.is_zero() {
+            return Err(BscBroadcastError::RpcError {
+                code: -32602,
+                message: "Transaction value must be strictly 0 for BEP-20 token transfers".to_string(),
+            });
+        }
+
+        // 7. Parse Data (item 5: must be exactly 68 bytes ERC-20 transfer(address,uint256))
+        if items[5].len() != 68 {
+            return Err(BscBroadcastError::RpcError {
+                code: -32602,
+                message: format!("ERC-20 transfer calldata must be exactly 68 bytes, got {}", items[5].len()),
+            });
+        }
+        if items[5][0..4] != crate::wallet::tx::bsc::calldata::ERC20_TRANSFER_SELECTOR {
+            return Err(BscBroadcastError::RpcError {
+                code: -32602,
+                message: "Transaction calldata does not match ERC-20 transfer selector (0xa9059cbb)".to_string(),
+            });
+        }
+        if items[5][4..16].iter().any(|&b| b != 0) {
+            return Err(BscBroadcastError::RpcError {
+                code: -32602,
+                message: "Invalid recipient padding in ERC-20 calldata: leading 12 bytes must be zero".to_string(),
+            });
+        }
+        let decoded_recipient = crate::wallet::tx::policy::to_eip55_checksum(&hex::encode(&items[5][16..36]));
+        let decoded_amount = BigUint::from_bytes_be(&items[5][36..68]);
+
+        // 8. Parse v (item 6: EIP-155 replay protection)
         let mut v = 0u64;
         for &b in &items[6] {
             v = (v << 8) | (b as u64);
@@ -327,37 +424,92 @@ impl RpcBscBroadcaster {
                 format!("EIP-155 chain ID mismatch in raw transaction: expected 97 (BSC Testnet), found {}", chain_id),
             ));
         }
-
-        // Item 3: to address (must match testnet USDT contract)
-        let to_hex = format!("0x{}", hex::encode(&items[3]));
-        if to_hex.to_lowercase() != crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT.to_lowercase() {
-            return Err(BscBroadcastError::NetworkForbidden(
-                format!("Unauthorized recipient contract: expected {}, got {}", crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT, to_hex),
-            ));
-        }
-
-        // Item 4: value (must be strictly 0 for token transfers)
-        if !items[4].is_empty() && items[4].iter().any(|&b| b != 0) {
+        if v != chain_id * 2 + 35 && v != chain_id * 2 + 36 {
             return Err(BscBroadcastError::RpcError {
                 code: -32602,
-                message: "Transaction value must be 0 for token transfers".to_string(),
+                message: format!("Invalid v value {} for chain ID {}", v, chain_id),
             });
         }
 
-        // Item 5: data (must start with ERC20 transfer selector 0xa9059cbb)
-        if items[5].len() < 4 || items[5][0..4] != [0xa9, 0x05, 0x9c, 0xbb] {
-            return Err(BscBroadcastError::RpcError {
+        // 9. Parse r and s (items 7 and 8: signature scalars)
+        if items[7].is_empty() || items[7].len() > 32 {
+            return Err(BscBroadcastError::RpcError { code: -32602, message: "Invalid r length in signature".to_string() });
+        }
+        if items[8].is_empty() || items[8].len() > 32 {
+            return Err(BscBroadcastError::RpcError { code: -32602, message: "Invalid s length in signature".to_string() });
+        }
+        let mut r = [0u8; 32];
+        let mut s = [0u8; 32];
+        r[32 - items[7].len()..].copy_from_slice(&items[7]);
+        s[32 - items[8].len()..].copy_from_slice(&items[8]);
+
+        // 10. Reconstruct Eip155SignedTransaction and cryptographically verify signature & recover sender
+        let tx = crate::wallet::signer::bsc::Eip155Transaction {
+            nonce,
+            gas_price,
+            gas_limit,
+            to: to_addr,
+            value,
+            data: items[5].clone(),
+            chain_id,
+        };
+        let signed_tx = crate::wallet::signer::bsc::Eip155SignedTransaction {
+            tx,
+            v,
+            r,
+            s,
+            raw_signed_tx_bytes: raw_bytes.clone(),
+        };
+
+        let secp = secp256k1::Secp256k1::new();
+        let recovered_sender = signed_tx.recover_sender(&secp)
+            .map_err(|e| BscBroadcastError::RpcError {
                 code: -32602,
-                message: "Transaction calldata does not match ERC-20 transfer selector (0xa9059cbb)".to_string(),
-            });
+                message: format!("Cryptographic signature verification or sender recovery failed: {}", e),
+            })?;
+
+        // 11. Strict validation against approved draft parameters (if provided)
+        if let Some(exp_sender) = expected_sender {
+            if recovered_sender.to_lowercase() != exp_sender.to_lowercase() {
+                return Err(BscBroadcastError::RpcError {
+                    code: -32602,
+                    message: format!("Recovered sender '{}' does not match approved draft sender '{}'", recovered_sender, exp_sender),
+                });
+            }
         }
 
+        if let Some(exp_recip) = expected_recipient {
+            if decoded_recipient.to_lowercase() != exp_recip.to_lowercase() {
+                return Err(BscBroadcastError::RpcError {
+                    code: -32602,
+                    message: format!("Decoded calldata recipient '{}' does not match approved draft recipient '{}'", decoded_recipient, exp_recip),
+                });
+            }
+        }
+
+        if let Some(exp_amount_str) = expected_amount_raw {
+            let actual_amount_str = decoded_amount.to_str_radix(10);
+            if actual_amount_str != exp_amount_str {
+                return Err(BscBroadcastError::RpcError {
+                    code: -32602,
+                    message: format!("Decoded calldata amount '{}' does not match approved draft amount '{}'", actual_amount_str, exp_amount_str),
+                });
+            }
+        }
+
+        // 12. Local Keccak-256 hash calculation
         let mut hasher = Keccak::v256();
         let mut hash = [0u8; 32];
         hasher.update(&raw_bytes);
         hasher.finalize(&mut hash);
         let computed_hash = format!("0x{}", hex::encode(hash));
         Ok(computed_hash)
+    }
+
+    /// Dry-run verification (G5A): Decodes RLP, parses EIP-155 signature fields,
+    /// verifies chain ID 97, recipient contract, zero value, ERC-20 selector, and recovers signature
+    pub fn dry_run_verify(&self, raw_tx_hex: &str, network: BroadcastNetwork) -> Result<String, BscBroadcastError> {
+        self.dry_run_verify_against_draft(raw_tx_hex, None, None, None, network)
     }
 
     /// Dry-run query: strictly parses nonce and balance via JSON-RPC without unwrap_or(0) defaults
@@ -386,30 +538,43 @@ impl RpcBscBroadcaster {
             format!("0x{}", tx_hash)
         };
 
-        // 1. First check if a receipt already exists (mined block)
+        // 1. First check if a receipt already exists (mined block) with strict fail-closed parsing
         let receipt_str = self.call_rpc("eth_getTransactionReceipt", serde_json::json!([formatted_hash]))?;
         if receipt_str != "null" && !receipt_str.trim().is_empty() {
             let receipt: serde_json::Value = serde_json::from_str(&receipt_str)
                 .map_err(|e| BscBroadcastError::RpcError { code: -32700, message: format!("Cannot parse receipt JSON: {}", e) })?;
 
-            let status_hex = receipt.get("status").and_then(|v| v.as_str()).unwrap_or("0x0");
-            let block_number_hex = receipt.get("blockNumber").and_then(|v| v.as_str()).unwrap_or("0x0");
-            let block_number = u64::from_str_radix(block_number_hex.trim_start_matches("0x"), 16).unwrap_or(0);
-            let block_hash = receipt.get("blockHash").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let gas_used_hex = receipt.get("gasUsed").and_then(|v| v.as_str()).unwrap_or("0x0");
-            let gas_used = u64::from_str_radix(gas_used_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+            let status_hex = receipt.get("status").and_then(|v| v.as_str())
+                .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'status' field".to_string() })?;
+            let block_number_hex = receipt.get("blockNumber").and_then(|v| v.as_str())
+                .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'blockNumber' field".to_string() })?;
+            let block_number = u64::from_str_radix(block_number_hex.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                .map_err(|e| BscBroadcastError::RpcError { code: -32603, message: format!("Invalid blockNumber hex: {}", e) })?;
+            let block_hash = receipt.get("blockHash").and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'blockHash' field".to_string() })?
+                .to_string();
+            let gas_used_hex = receipt.get("gasUsed").and_then(|v| v.as_str())
+                .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'gasUsed' field".to_string() })?;
+            let gas_used = u64::from_str_radix(gas_used_hex.trim_start_matches("0x").trim_start_matches("0X"), 16)
+                .map_err(|e| BscBroadcastError::RpcError { code: -32603, message: format!("Invalid gasUsed hex: {}", e) })?;
 
-            if status_hex == "0x1" {
+            if status_hex == "0x1" || status_hex == "0x01" {
                 return Ok(BscReceiptStatus::Success {
                     block_number,
                     block_hash,
                     gas_used,
                 });
-            } else {
+            } else if status_hex == "0x0" || status_hex == "0x00" {
                 return Ok(BscReceiptStatus::Reverted {
                     block_number,
                     block_hash,
                     reason: "EVM execution reverted (status 0x0)".to_string(),
+                });
+            } else {
+                return Err(BscBroadcastError::RpcError {
+                    code: -32603,
+                    message: format!("Unrecognized receipt status '{}'", status_hex),
                 });
             }
         }
@@ -501,6 +666,29 @@ impl BscBroadcaster for RpcBscBroadcaster {
         Ok(computed_hash)
     }
 
+    fn broadcast_verified(
+        &self,
+        raw_signed_hex: &str,
+        expected_sender: Option<&str>,
+        expected_recipient: Option<&str>,
+        expected_amount_raw: Option<&str>,
+        network: BroadcastNetwork,
+    ) -> Result<String, BscBroadcastError> {
+        let computed_hash = self.dry_run_verify_against_draft(
+            raw_signed_hex,
+            expected_sender,
+            expected_recipient,
+            expected_amount_raw,
+            network,
+        )?;
+
+        if !self.broadcast_enabled {
+            return Ok(format!("dry_run_{}", computed_hash));
+        }
+
+        self.broadcast(raw_signed_hex, network)
+    }
+
     fn query_receipt(&self, tx_hash: &str, network: BroadcastNetwork) -> Result<BscReceiptStatus, BscBroadcastError> {
         if network != BroadcastNetwork::BscTestnet {
             return Err(BscBroadcastError::NetworkForbidden(
@@ -522,24 +710,37 @@ impl BscBroadcaster for RpcBscBroadcaster {
         let receipt: serde_json::Value = serde_json::from_str(&result_str)
             .map_err(|e| BscBroadcastError::RpcError { code: -32700, message: format!("Cannot parse receipt JSON: {}", e) })?;
 
-        let status_hex = receipt.get("status").and_then(|v| v.as_str()).unwrap_or("0x0");
-        let block_number_hex = receipt.get("blockNumber").and_then(|v| v.as_str()).unwrap_or("0x0");
-        let block_number = u64::from_str_radix(block_number_hex.trim_start_matches("0x"), 16).unwrap_or(0);
-        let block_hash = receipt.get("blockHash").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let gas_used_hex = receipt.get("gasUsed").and_then(|v| v.as_str()).unwrap_or("0x0");
-        let gas_used = u64::from_str_radix(gas_used_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+        let status_hex = receipt.get("status").and_then(|v| v.as_str())
+            .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'status' field".to_string() })?;
+        let block_number_hex = receipt.get("blockNumber").and_then(|v| v.as_str())
+            .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'blockNumber' field".to_string() })?;
+        let block_number = u64::from_str_radix(block_number_hex.trim_start_matches("0x").trim_start_matches("0X"), 16)
+            .map_err(|e| BscBroadcastError::RpcError { code: -32603, message: format!("Invalid blockNumber hex: {}", e) })?;
+        let block_hash = receipt.get("blockHash").and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'blockHash' field".to_string() })?
+            .to_string();
+        let gas_used_hex = receipt.get("gasUsed").and_then(|v| v.as_str())
+            .ok_or_else(|| BscBroadcastError::RpcError { code: -32603, message: "Receipt missing 'gasUsed' field".to_string() })?;
+        let gas_used = u64::from_str_radix(gas_used_hex.trim_start_matches("0x").trim_start_matches("0X"), 16)
+            .map_err(|e| BscBroadcastError::RpcError { code: -32603, message: format!("Invalid gasUsed hex: {}", e) })?;
 
-        if status_hex == "0x1" {
+        if status_hex == "0x1" || status_hex == "0x01" {
             Ok(BscReceiptStatus::Success {
                 block_number,
                 block_hash,
                 gas_used,
             })
-        } else {
+        } else if status_hex == "0x0" || status_hex == "0x00" {
             Ok(BscReceiptStatus::Reverted {
                 block_number,
                 block_hash,
                 reason: "EVM execution reverted (status 0x0)".to_string(),
+            })
+        } else {
+            Err(BscBroadcastError::RpcError {
+                code: -32603,
+                message: format!("Unrecognized receipt status '{}'", status_hex),
             })
         }
     }

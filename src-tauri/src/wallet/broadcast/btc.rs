@@ -84,6 +84,13 @@ pub fn parse_esplora_error(status_code: u16, response_body: &str) -> BtcBroadcas
 #[allow(dead_code)]
 pub trait BtcBroadcaster: Send + Sync {
     fn broadcast(&self, raw_tx_hex: &str, network: BroadcastNetwork) -> Result<String, BtcBroadcastError>;
+    fn broadcast_verified(
+        &self,
+        raw_tx_hex: &str,
+        expected_txid: &str,
+        expected_wtxid: &str,
+        network: BroadcastNetwork,
+    ) -> Result<String, BtcBroadcastError>;
     fn query_status(&self, txid: &str, network: BroadcastNetwork) -> Result<BtcTxQueryStatus, BtcBroadcastError>;
 }
 
@@ -148,6 +155,16 @@ impl BtcBroadcaster for MockBtcBroadcaster {
         Ok(txid)
     }
 
+    fn broadcast_verified(
+        &self,
+        raw_tx_hex: &str,
+        _expected_txid: &str,
+        _expected_wtxid: &str,
+        network: BroadcastNetwork,
+    ) -> Result<String, BtcBroadcastError> {
+        self.broadcast(raw_tx_hex, network)
+    }
+
     fn query_status(&self, txid: &str, network: BroadcastNetwork) -> Result<BtcTxQueryStatus, BtcBroadcastError> {
         if network != BroadcastNetwork::BitcoinSignet {
             return Err(BtcBroadcastError::NetworkForbidden(
@@ -189,8 +206,8 @@ impl EsploraBtcBroadcaster {
     }
 
     /// Dry-run verification (G5A): Deserializes raw tx, validates inputs/outputs,
-    /// checks testnet network, and calculates txid locally without any network POST.
-    pub fn dry_run_verify(&self, raw_tx_hex: &str, network: BroadcastNetwork) -> Result<(bitcoin::Transaction, String), BtcBroadcastError> {
+    /// checks SegWit witnesses, checks testnet network, and calculates txid and wtxid locally without any network POST.
+    pub fn dry_run_verify(&self, raw_tx_hex: &str, network: BroadcastNetwork) -> Result<(bitcoin::Transaction, String, String), BtcBroadcastError> {
         if network != BroadcastNetwork::BitcoinSignet {
             return Err(BtcBroadcastError::NetworkForbidden(
                 format!("Network {:?} is strictly forbidden. Only Bitcoin Signet is permitted.", network)
@@ -211,17 +228,35 @@ impl EsploraBtcBroadcaster {
             return Err(BtcBroadcastError::NodeRejected("Transaction has no outputs".to_string()));
         }
 
+        // BIP-141 SegWit Witness Check:
+        // Every input of a native SegWit (BIP84) transaction must contain non-empty witness data
+        for (i, input) in tx.input.iter().enumerate() {
+            if input.witness.is_empty() {
+                return Err(BtcBroadcastError::NodeRejected(format!(
+                    "Input {} lacks SegWit witness: raw signed transaction must contain witness data",
+                    i
+                )));
+            }
+        }
+
         let computed_txid = tx.compute_txid().to_string();
-        Ok((tx, computed_txid))
+        let computed_wtxid = tx.compute_wtxid().to_string();
+        Ok((tx, computed_txid, computed_wtxid))
     }
 
-    /// Verifies that the raw transaction txid strictly matches the approved draft txid before broadcasting
-    pub fn broadcast_verified(&self, raw_tx_hex: &str, expected_txid: &str, network: BroadcastNetwork) -> Result<String, BtcBroadcastError> {
-        let (_tx, computed_txid) = self.dry_run_verify(raw_tx_hex, network)?;
+    /// Verifies that the raw transaction txid AND wtxid strictly match the approved draft before broadcasting
+    pub fn broadcast_verified(&self, raw_tx_hex: &str, expected_txid: &str, expected_wtxid: &str, network: BroadcastNetwork) -> Result<String, BtcBroadcastError> {
+        let (_tx, computed_txid, computed_wtxid) = self.dry_run_verify(raw_tx_hex, network)?;
         if computed_txid != expected_txid {
             return Err(BtcBroadcastError::NodeRejected(format!(
                 "Raw transaction txid '{}' does not match approved transaction txid '{}'",
                 computed_txid, expected_txid
+            )));
+        }
+        if computed_wtxid != expected_wtxid {
+            return Err(BtcBroadcastError::NodeRejected(format!(
+                "Raw transaction wtxid '{}' does not match approved transaction wtxid '{}' (witness mismatch)",
+                computed_wtxid, expected_wtxid
             )));
         }
         self.broadcast(raw_tx_hex, network)
@@ -230,7 +265,7 @@ impl EsploraBtcBroadcaster {
 
 impl BtcBroadcaster for EsploraBtcBroadcaster {
     fn broadcast(&self, raw_tx_hex: &str, network: BroadcastNetwork) -> Result<String, BtcBroadcastError> {
-        let (_tx, computed_txid) = self.dry_run_verify(raw_tx_hex, network)?;
+        let (_tx, computed_txid, _computed_wtxid) = self.dry_run_verify(raw_tx_hex, network)?;
 
         // If broadcast is locked (feature-gated / default mode): return dry-run computed txid
         if !self.broadcast_enabled {
@@ -266,6 +301,16 @@ impl BtcBroadcaster for EsploraBtcBroadcaster {
         } else {
             Err(parse_esplora_error(status_code, &body))
         }
+    }
+
+    fn broadcast_verified(
+        &self,
+        raw_tx_hex: &str,
+        expected_txid: &str,
+        expected_wtxid: &str,
+        network: BroadcastNetwork,
+    ) -> Result<String, BtcBroadcastError> {
+        self.broadcast_verified(raw_tx_hex, expected_txid, expected_wtxid, network)
     }
 
     fn query_status(&self, txid: &str, network: BroadcastNetwork) -> Result<BtcTxQueryStatus, BtcBroadcastError> {
