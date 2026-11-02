@@ -186,7 +186,7 @@ impl BtcBroadcaster for MockBtcBroadcaster {
 pub struct EsploraBtcBroadcaster {
     pub esplora_url: String,
     pub broadcast_enabled: bool,
-    client: reqwest::blocking::Client,
+    client: Option<reqwest::blocking::Client>,
 }
 
 #[allow(dead_code)]
@@ -196,10 +196,14 @@ impl EsploraBtcBroadcaster {
     }
 
     pub fn with_endpoint(endpoint: &str, broadcast_enabled: bool) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        let client = if broadcast_enabled {
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .ok()
+        } else {
+            None
+        };
 
         Self {
             esplora_url: endpoint.to_string(),
@@ -402,8 +406,11 @@ impl BtcBroadcaster for EsploraBtcBroadcaster {
         }
 
         // Live broadcast (G5B locked mode):
+        let http_client = self.client.as_ref().ok_or_else(|| {
+            BtcBroadcastError::NodeRejected("Broadcaster HTTP client not initialized".into())
+        })?;
         let post_url = format!("{}/tx", self.esplora_url);
-        let resp = match self.client.post(&post_url).body(raw_tx_hex.trim().to_string()).send() {
+        let resp = match http_client.post(&post_url).body(raw_tx_hex.trim().to_string()).send() {
             Ok(r) => r,
             Err(e) => {
                 // If timeout occurred, DO NOT immediately retry or create a competing transaction:
@@ -450,8 +457,11 @@ impl BtcBroadcaster for EsploraBtcBroadcaster {
             ));
         }
 
+        let http_client = self.client.as_ref().ok_or_else(|| {
+            BtcBroadcastError::NodeRejected("Broadcaster HTTP client not initialized".into())
+        })?;
         let url = format!("{}/tx/{}/status", self.esplora_url, txid);
-        let resp = self.client.get(&url).send()
+        let resp = http_client.get(&url).send()
             .map_err(|e| BtcBroadcastError::Timeout(format!("Esplora query_status timed out: {}", e)))?;
 
         let status_code = resp.status().as_u16();

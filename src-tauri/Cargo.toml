@@ -5,6 +5,7 @@ description = "Local-only experimental BTC and BSC wallet foundation"
 authors = ["Vault Manager Contributors"]
 edition = "2021"
 rust-version = "1.82"
+default-run = "vault-manager"
 
 [lib]
 name = "vault_manager_lib"
@@ -34,7 +35,7 @@ num-traits = "0.2"
 hex = "0.4"
 secp256k1 = { version = "0.29", features = ["recovery", "global-context"] }
 alloy-rlp = { version = "0.3", default-features = false, features = ["derive"] }
-tokio = { version = "1", features = ["sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

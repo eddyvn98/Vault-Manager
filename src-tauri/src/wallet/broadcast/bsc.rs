@@ -296,7 +296,7 @@ pub fn parse_rlp_list(payload: &[u8]) -> Result<Vec<Vec<u8>>, String> {
 pub struct RpcBscBroadcaster {
     pub rpc_url: String,
     pub broadcast_enabled: bool,
-    client: reqwest::blocking::Client,
+    client: Option<reqwest::blocking::Client>,
 }
 
 #[allow(dead_code)]
@@ -306,11 +306,15 @@ impl RpcBscBroadcaster {
     }
 
     pub fn with_endpoint(endpoint: &str, broadcast_enabled: bool) -> Self {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
-            .user_agent("VaultManager/0.1.0")
-            .build()
-            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+        let client = if broadcast_enabled {
+            reqwest::blocking::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .user_agent("VaultManager/0.1.0")
+                .build()
+                .ok()
+        } else {
+            None
+        };
 
         Self {
             rpc_url: endpoint.to_string(),
@@ -636,7 +640,11 @@ impl RpcBscBroadcaster {
             "id": 1
         });
 
-        let resp = self.client.post(&self.rpc_url).json(&req).send()
+        let http_client = self.client.as_ref().ok_or_else(|| {
+            BscBroadcastError::NetworkForbidden("Broadcaster HTTP client not initialized".into())
+        })?;
+
+        let resp = http_client.post(&self.rpc_url).json(&req).send()
             .map_err(|e| BscBroadcastError::Timeout(format!("RPC call {} timed out: {}", method, e)))?;
 
         let status_code = resp.status().as_u16();

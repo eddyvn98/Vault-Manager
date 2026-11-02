@@ -1086,99 +1086,104 @@ pub async fn preflight_signed_transaction(
         }
     };
 
-    let mut checks = Vec::new();
+    let draft_id_clone = draft_id.clone();
+    tokio::task::spawn_blocking(move || -> Result<PreflightReport, String> {
+        let mut checks = Vec::new();
 
-    match record.network {
-        broadcast::types::BroadcastNetwork::BitcoinSignet => {
-            let esplora = broadcast::btc::EsploraBtcBroadcaster::new(false);
-            let (tx, computed_txid, computed_wtxid) = esplora
-                .dry_run_verify(&raw_tx_hex, record.network)
-                .map_err(|e| format!("BTC dry-run verification failed: {}", e))?;
+        match record.network {
+            broadcast::types::BroadcastNetwork::BitcoinSignet => {
+                let esplora = broadcast::btc::EsploraBtcBroadcaster::new(false);
+                let (tx, computed_txid, computed_wtxid) = esplora
+                    .dry_run_verify(&raw_tx_hex, record.network)
+                    .map_err(|e| format!("BTC dry-run verification failed: {}", e))?;
 
-            if let Some(ref exp_txid) = record.expected_txid {
-                if exp_txid != &computed_txid {
-                    return Err(format!("Preflight verification mismatch: expected txid {}, got {}", exp_txid, computed_txid));
+                if let Some(ref exp_txid) = record.expected_txid {
+                    if exp_txid != &computed_txid {
+                        return Err(format!("Preflight verification mismatch: expected txid {}, got {}", exp_txid, computed_txid));
+                    }
+                } else {
+                    return Err("Record missing expected_txid".to_string());
                 }
-            } else {
-                return Err("Record missing expected_txid".to_string());
-            }
 
-            if let Some(ref exp_wtxid) = record.expected_wtxid {
-                if exp_wtxid != &computed_wtxid {
-                    return Err(format!("Preflight verification mismatch: expected wtxid {}, got {}", exp_wtxid, computed_wtxid));
+                if let Some(ref exp_wtxid) = record.expected_wtxid {
+                    if exp_wtxid != &computed_wtxid {
+                        return Err(format!("Preflight verification mismatch: expected wtxid {}, got {}", exp_wtxid, computed_wtxid));
+                    }
+                } else {
+                    return Err("Record missing expected_wtxid".to_string());
                 }
-            } else {
-                return Err("Record missing expected_wtxid".to_string());
+
+                let prevouts = record.approved_prevouts.as_ref().ok_or_else(|| {
+                    "Preflight failure: approved_prevouts missing in coordinator record".to_string()
+                })?;
+
+                // Mandatory cryptographic input signature verification: checks DER signatures, pubkeys, and BIP-143 sighash!
+                esplora
+                    .verify_input_signatures(&tx, prevouts)
+                    .map_err(|e| format!("Cryptographic input signature verification failed: {}", e))?;
+
+                checks.push("Successfully deserialized signed raw Bitcoin transaction".to_string());
+                checks.push(format!("Verified computed txid matches approved expected_txid: {}", computed_txid));
+                checks.push(format!("Verified computed wtxid matches approved expected_wtxid: {}", computed_wtxid));
+                checks.push(format!("Cryptographically verified ECDSA signatures and BIP-143 sighash for all {} inputs", tx.input.len()));
+                checks.push("Preflight validation passed: Signed Bitcoin Signet transaction is 100% cryptographically verified".to_string());
+
+                Ok(PreflightReport {
+                    draft_id: draft_id_clone,
+                    network: "BitcoinSignet".to_string(),
+                    status: "Signed".to_string(),
+                    is_valid: true,
+                    raw_tx_hex,
+                    txid_or_hash: computed_txid,
+                    checks,
+                })
             }
+            broadcast::types::BroadcastNetwork::BscTestnet => {
+                let rpc = broadcast::bsc::RpcBscBroadcaster::new(false);
+                let exp_sender = record.expected_sender.as_deref().ok_or("Record missing expected_sender")?;
+                let exp_recip = record.expected_recipient.as_deref().ok_or("Record missing expected_recipient")?;
+                let exp_amount = record.expected_amount_raw.as_deref().ok_or("Record missing expected_amount_raw")?;
+                let exp_nonce = record.expected_nonce.ok_or("Record missing expected_nonce")?;
+                let exp_gas_limit = record.expected_gas_limit.ok_or("Record missing expected_gas_limit")?;
+                let exp_gas_price = record.expected_gas_price.as_deref().ok_or("Record missing expected_gas_price")?;
 
-            let prevouts = record.approved_prevouts.as_ref().ok_or_else(|| {
-                "Preflight failure: approved_prevouts missing in coordinator record".to_string()
-            })?;
+                // Mandatory full cryptographic verification: RLP parsing, chain ID 97, ERC-20 transfer calldata,
+                // recipient, amount, nonce, gas limit, gas price, and secp256k1 ecrecover sender address!
+                let computed_tx_hash = rpc
+                    .dry_run_verify_against_draft(
+                        &raw_tx_hex,
+                        Some(exp_sender),
+                        Some(exp_recip),
+                        Some(exp_amount),
+                        Some(exp_nonce),
+                        Some(exp_gas_limit),
+                        Some(exp_gas_price),
+                        record.network,
+                    )
+                    .map_err(|e| format!("BSC cryptographic preflight verification failed: {}", e))?;
 
-            // Mandatory cryptographic input signature verification: checks DER signatures, pubkeys, and BIP-143 sighash!
-            esplora
-                .verify_input_signatures(&tx, prevouts)
-                .map_err(|e| format!("Cryptographic input signature verification failed: {}", e))?;
+                checks.push("Successfully decoded and parsed EIP-155 RLP transaction list".to_string());
+                checks.push("Verified Chain ID is 97 (BSC Testnet replay protection)".to_string());
+                checks.push("Cryptographically recovered signer address via secp256k1 and verified matches expected_sender".to_string());
+                checks.push(format!("Verified ERC-20 transfer calldata: recipient={}, amount={}", exp_recip, exp_amount));
+                checks.push(format!("Verified nonce={}, gas_limit={}, gas_price={}", exp_nonce, exp_gas_limit, exp_gas_price));
+                checks.push(format!("Computed Keccak-256 transaction hash: {}", computed_tx_hash));
+                checks.push("Preflight validation passed: Signed BSC transaction is 100% cryptographically verified".to_string());
 
-            checks.push("Successfully deserialized signed raw Bitcoin transaction".to_string());
-            checks.push(format!("Verified computed txid matches approved expected_txid: {}", computed_txid));
-            checks.push(format!("Verified computed wtxid matches approved expected_wtxid: {}", computed_wtxid));
-            checks.push(format!("Cryptographically verified ECDSA signatures and BIP-143 sighash for all {} inputs", tx.input.len()));
-            checks.push("Preflight validation passed: Signed Bitcoin Signet transaction is 100% cryptographically verified".to_string());
-
-            Ok(PreflightReport {
-                draft_id,
-                network: "BitcoinSignet".to_string(),
-                status: "Signed".to_string(),
-                is_valid: true,
-                raw_tx_hex,
-                txid_or_hash: computed_txid,
-                checks,
-            })
+                Ok(PreflightReport {
+                    draft_id: draft_id_clone,
+                    network: "BscTestnet".to_string(),
+                    status: "Signed".to_string(),
+                    is_valid: true,
+                    raw_tx_hex: format!("0x{}", raw_tx_hex.trim_start_matches("0x").trim_start_matches("0X")),
+                    txid_or_hash: computed_tx_hash,
+                    checks,
+                })
+            }
         }
-        broadcast::types::BroadcastNetwork::BscTestnet => {
-            let rpc = broadcast::bsc::RpcBscBroadcaster::new(false);
-            let exp_sender = record.expected_sender.as_deref().ok_or("Record missing expected_sender")?;
-            let exp_recip = record.expected_recipient.as_deref().ok_or("Record missing expected_recipient")?;
-            let exp_amount = record.expected_amount_raw.as_deref().ok_or("Record missing expected_amount_raw")?;
-            let exp_nonce = record.expected_nonce.ok_or("Record missing expected_nonce")?;
-            let exp_gas_limit = record.expected_gas_limit.ok_or("Record missing expected_gas_limit")?;
-            let exp_gas_price = record.expected_gas_price.as_deref().ok_or("Record missing expected_gas_price")?;
-
-            // Mandatory full cryptographic verification: RLP parsing, chain ID 97, ERC-20 transfer calldata,
-            // recipient, amount, nonce, gas limit, gas price, and secp256k1 ecrecover sender address!
-            let computed_tx_hash = rpc
-                .dry_run_verify_against_draft(
-                    &raw_tx_hex,
-                    Some(exp_sender),
-                    Some(exp_recip),
-                    Some(exp_amount),
-                    Some(exp_nonce),
-                    Some(exp_gas_limit),
-                    Some(exp_gas_price),
-                    record.network,
-                )
-                .map_err(|e| format!("BSC cryptographic preflight verification failed: {}", e))?;
-
-            checks.push("Successfully decoded and parsed EIP-155 RLP transaction list".to_string());
-            checks.push("Verified Chain ID is 97 (BSC Testnet replay protection)".to_string());
-            checks.push("Cryptographically recovered signer address via secp256k1 and verified matches expected_sender".to_string());
-            checks.push(format!("Verified ERC-20 transfer calldata: recipient={}, amount={}", exp_recip, exp_amount));
-            checks.push(format!("Verified nonce={}, gas_limit={}, gas_price={}", exp_nonce, exp_gas_limit, exp_gas_price));
-            checks.push(format!("Computed Keccak-256 transaction hash: {}", computed_tx_hash));
-            checks.push("Preflight validation passed: Signed BSC transaction is 100% cryptographically verified".to_string());
-
-            Ok(PreflightReport {
-                draft_id,
-                network: "BscTestnet".to_string(),
-                status: "Signed".to_string(),
-                is_valid: true,
-                raw_tx_hex: format!("0x{}", raw_tx_hex.trim_start_matches("0x").trim_start_matches("0X")),
-                txid_or_hash: computed_tx_hash,
-                checks,
-            })
-        }
-    }
+    })
+    .await
+    .map_err(|e| format!("Background preflight task panicked: {}", e))?
 }
 
 #[tauri::command]

@@ -52,10 +52,11 @@ export default function WalletApp() {
     return () => clearInterval(interval);
   }, [cooldown, refresh]);
 
-  // Window visibility / background lock
+  // Window visibility / background lock (disabled in DEV mode to allow pair-programming/automation without instant re-lock)
   useEffect(() => {
+    const isDev = Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV);
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden' && status.unlocked) {
+      if (document.visibilityState === 'hidden' && status.unlocked && !isDev) {
         void invoke('lock_wallet').then(refresh).catch(() => {});
       }
     };
