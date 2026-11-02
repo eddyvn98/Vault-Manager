@@ -118,7 +118,11 @@ mod tests {
         let b = encrypt("safe-password-123", msg).unwrap();
         assert_ne!(a, b);
         let mut envelope: Envelope = serde_json::from_slice(&a).unwrap();
-        envelope.ciphertext.replace_range(0..1, "X");
+        if envelope.ciphertext.starts_with('X') {
+            envelope.ciphertext.replace_range(0..1, "Y");
+        } else {
+            envelope.ciphertext.replace_range(0..1, "X");
+        }
         assert!(decrypt("safe-password-123", &serde_json::to_vec(&envelope).unwrap()).is_err());
     }
 }

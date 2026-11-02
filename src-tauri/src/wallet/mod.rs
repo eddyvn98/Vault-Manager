@@ -1,5 +1,6 @@
 pub mod bip;
 pub mod blockchain;
+pub mod broadcast;
 pub mod crypto;
 pub mod lockout;
 pub mod signer;
