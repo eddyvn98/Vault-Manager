@@ -2,6 +2,7 @@ pub mod bip;
 pub mod blockchain;
 pub mod crypto;
 pub mod lockout;
+pub mod tx;
 
 use std::{
     fs,
@@ -22,6 +23,7 @@ pub struct SessionState {
     pub mnemonic: Option<Zeroizing<String>>,
     pub last_activity: Option<Instant>,
     pub pending_creation: Option<Zeroizing<String>>,
+    pub active_draft_id: Option<String>,
 }
 
 pub struct WalletSession {
@@ -225,6 +227,7 @@ pub fn lock_wallet(state: State<'_, WalletSession>) -> Result<(), String> {
     let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
     session.mnemonic = None;
     session.last_activity = None;
+    session.active_draft_id = None;
     Ok(())
 }
 
@@ -337,6 +340,64 @@ pub async fn query_bsc_balance(
 
     // 2. Perform async network request without holding any Mutex
     blockchain::fetch_bsc_balance(&target_address, testnet).await
+}
+
+#[tauri::command]
+pub async fn prepare_btc_transaction(
+    state: State<'_, WalletSession>,
+    recipient: String,
+    amount_satoshis: u64,
+    fee_rate_sat_vb: Option<u64>,
+) -> Result<tx::BtcTxPreview, String> {
+    let mnemonic = {
+        let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+        if !check_and_apply_auto_lock(&mut session) {
+            return Err("Wallet is locked".into());
+        }
+        let m = session
+            .mnemonic
+            .as_ref()
+            .ok_or_else(|| "Wallet is locked".to_string())?;
+        m.clone()
+    };
+
+    let preview =
+        tx::btc::prepare::prepare_signet_tx(&mnemonic, &recipient, amount_satoshis, fee_rate_sat_vb)
+            .await?;
+
+    if let Ok(mut session) = state.session.lock() {
+        session.active_draft_id = Some(preview.draft_id.clone());
+    }
+
+    Ok(preview)
+}
+
+#[tauri::command]
+pub async fn prepare_bsc_transaction(
+    state: State<'_, WalletSession>,
+    recipient: String,
+    amount_tokens: String,
+) -> Result<tx::BscTxPreview, String> {
+    let mnemonic = {
+        let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
+        if !check_and_apply_auto_lock(&mut session) {
+            return Err("Wallet is locked".into());
+        }
+        let m = session
+            .mnemonic
+            .as_ref()
+            .ok_or_else(|| "Wallet is locked".to_string())?;
+        m.clone()
+    };
+
+    let preview =
+        tx::bsc::prepare::prepare_bsc_testnet_tx(&mnemonic, &recipient, &amount_tokens).await?;
+
+    if let Ok(mut session) = state.session.lock() {
+        session.active_draft_id = Some(preview.draft_id.clone());
+    }
+
+    Ok(preview)
 }
 
 /// Secure reset: Requires valid password verification to authenticate the owner before deleting.

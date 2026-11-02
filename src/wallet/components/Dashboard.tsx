@@ -10,6 +10,7 @@ import {
   RotateCw,
   Coins,
   Info,
+  Send,
 } from 'lucide-react';
 import {
   PublicAddresses,
@@ -17,6 +18,7 @@ import {
   BscBalance,
   getErrorMessage,
 } from '../types';
+import TxPrepareModal from './TxPrepareModal';
 
 interface DashboardProps {
   onLock: () => void;
@@ -48,6 +50,10 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
   const [resetPassword, setResetPassword] = useState('');
   const [resetBusy, setResetBusy] = useState(false);
   const [resetError, setResetError] = useState('');
+
+  // Transaction Preparation Modal (P2C-1)
+  const [showTxModal, setShowTxModal] = useState(false);
+  const [txModalNet, setTxModalNet] = useState<'btc' | 'bsc'>('btc');
 
   // Fetch BTC Balance with sequence-id guard against race conditions
   const fetchBtcBalance = useCallback(
@@ -409,6 +415,17 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
       </div>
 
       <div className="dashboard-actions">
+        <button
+          type="button"
+          onClick={() => {
+            setTxModalNet(btcNetwork === 'signet' ? 'btc' : 'bsc');
+            setShowTxModal(true);
+          }}
+          disabled={busy}
+        >
+          <Send size={16} /> Prepare Tx (Testnet Preview)
+        </button>
+
         <button disabled={busy} onClick={() => void handleLock()}>
           <Lock size={16} /> Lock Vault
         </button>
@@ -425,6 +442,13 @@ export default function Dashboard({ onLock, onResetSuccess, onError }: Dashboard
           <Trash2 size={16} /> Authenticated Reset
         </button>
       </div>
+
+      {showTxModal && (
+        <TxPrepareModal
+          defaultNetwork={txModalNet}
+          onClose={() => setShowTxModal(false)}
+        />
+      )}
 
       {showResetModal && (
         <div className="modal-backdrop">

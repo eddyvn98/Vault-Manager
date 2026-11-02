@@ -45,6 +45,51 @@ export type BscBalance = {
   usdt: TokenBalance;
 };
 
+export type UtxoInfo = {
+  txid: string;
+  vout: number;
+  valueSatoshis: number;
+  address: string;
+};
+
+export type BtcTxPreview = {
+  draftId: string;
+  network: string;
+  recipientAddress: string;
+  amountSatoshis: number;
+  formattedAmountBtc: string;
+  feeSatoshis: number;
+  formattedFeeBtc: string;
+  feeRateSatPerVb: number;
+  selectedUtxos: UtxoInfo[];
+  changeAddress: string;
+  changeSatoshis: number;
+  unsignedPsbtBase64: string;
+  signingEnabled: boolean;
+  note: string;
+};
+
+export type BscTxPreview = {
+  draftId: string;
+  chainId: number;
+  networkName: string;
+  isTokenTransfer: boolean;
+  tokenSymbol: string;
+  tokenContract?: string;
+  fromAddress: string;
+  recipientAddress: string;
+  amountRaw: string;
+  formattedAmount: string;
+  nonce: number;
+  gasLimit: number;
+  gasPriceGwei: string;
+  estimatedFeeBnb: string;
+  calldataHex: string;
+  unsignedTxSummary: string;
+  signingEnabled: boolean;
+  note: string;
+};
+
 export type Action = 'create' | 'restore' | 'unlock';
 
 export const offlineStatus: WalletStatus = {
