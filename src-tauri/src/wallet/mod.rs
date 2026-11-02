@@ -3152,8 +3152,166 @@ mod tests {
         let bsc_status_pending = coord.poll_bsc_lifecycle(draft_bsc, &mock_bsc, now_unix + 10).unwrap();
         assert!(matches!(bsc_status_pending, TxLifecycleStatus::Pending { .. }));
 
+        // Complete broadcast from in-flight task cleans up the active lease
+        let comp_res = coord.complete_broadcast_bsc(
+            draft_bsc,
+            _ctx_bsc.lease_token,
+            Ok(bsc_tx_hash.clone()),
+            1,
+            1,
+            now_unix + 12,
+        ).unwrap();
+        assert_eq!(comp_res, broadcast::lifecycle::BroadcastOutcome::Success(bsc_tx_hash));
+
         // Active lease is now safely reconciled and cleared
         assert!(!coord.active_leases.contains_key(draft_bsc));
+
+        let _ = fs::remove_file(temp_storage);
+    }
+
+    #[test]
+    fn test_t78_poll_complete_race_preserves_pending_and_success_callback() {
+        use crate::wallet::broadcast::{
+            btc::{BtcTxQueryStatus, MockBtcBroadcaster},
+            bsc::{BscReceiptStatus, MockBscBroadcaster},
+            types::{BroadcastNetwork, TxLifecycleStatus},
+        };
+
+        let temp_storage = std::env::temp_dir().join(format!("t78_coord_{}.json", LockoutManager::now_unix()));
+        let mut coord = broadcast::lifecycle::TxLifecycleCoordinator::default();
+        coord.set_storage_path(temp_storage.clone());
+        let now_unix = LockoutManager::now_unix();
+
+        // 1. BTC POLL/COMPLETE RACE
+        let draft_btc = "draft-btc-t78-race";
+        coord.register_draft(draft_btc, BroadcastNetwork::BitcoinSignet, now_unix).unwrap();
+        coord.record_signed_btc(
+            draft_btc,
+            "0x7878",
+            "0200000001...",
+            "txid_t78_btc",
+            "wtxid_t78_btc",
+            vec![broadcast::types::ApprovedPrevout {
+                txid: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                vout: 0,
+                value_satoshis: 18_000,
+                script_pubkey_hex: "0014...".into(),
+            }],
+            now_unix,
+        ).unwrap();
+
+        // HTTP POST A begins -> acquires exclusive lease #1
+        let ctx_btc = coord.begin_broadcast_btc(draft_btc, 1, now_unix).unwrap();
+        assert_eq!(ctx_btc.lease_token, 1);
+
+        // While HTTP POST A is still in transit (e.g. slow network), background polling runs
+        // Node has already accepted tx into mempool:
+        let mock_btc = MockBtcBroadcaster::new();
+        mock_btc.set_tx_status("txid_t78_btc", BtcTxQueryStatus::InMempool);
+        let polled_st = coord.poll_btc_lifecycle(draft_btc, &mock_btc, now_unix + 2).unwrap();
+        assert!(matches!(polled_st, TxLifecycleStatus::Pending { .. }));
+
+        // Now HTTP POST A finishes and calls complete_broadcast_btc with lease #1:
+        // MUST NOT RETURN STALE LEASE ERROR! Must return Success with genuine txid!
+        let complete_res = coord.complete_broadcast_btc(
+            draft_btc,
+            ctx_btc.lease_token,
+            Ok("txid_t78_btc".into()),
+            1,
+            1,
+            now_unix + 5,
+        ).unwrap();
+        assert_eq!(complete_res, broadcast::lifecycle::BroadcastOutcome::Success("txid_t78_btc".into()));
+        let final_rec = coord.get_record(draft_btc).unwrap();
+        assert!(matches!(final_rec.status, TxLifecycleStatus::Pending { .. }));
+        assert!(!coord.active_leases.contains_key(draft_btc));
+
+        // 2. BSC POLL/COMPLETE RACE
+        let draft_bsc = "draft-bsc-t78-race";
+        coord.register_draft(draft_bsc, BroadcastNetwork::BscTestnet, now_unix).unwrap();
+        coord.record_signed_bsc(
+            draft_bsc,
+            "0x7878bsc",
+            "0xf86c018504a817c8008252089411111111111111111111111111111111111111118080",
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            "700",
+            0,
+            65_000,
+            "3000000000",
+            now_unix,
+        ).unwrap();
+
+        let ctx_bsc = coord.begin_broadcast_bsc(draft_bsc, 1, now_unix).unwrap();
+        let bsc_tx_hash = coord.get_record(draft_bsc).unwrap().tx_hash.clone().unwrap();
+
+        let mock_bsc = MockBscBroadcaster::new();
+        mock_bsc.set_receipt(&bsc_tx_hash, BscReceiptStatus::Pending);
+        let polled_bsc_st = coord.poll_bsc_lifecycle(draft_bsc, &mock_bsc, now_unix + 2).unwrap();
+        assert!(matches!(polled_bsc_st, TxLifecycleStatus::Pending { .. }));
+
+        // In-flight BSC POST finishes and completes -> returns Success with bsc_tx_hash!
+        let complete_bsc_res = coord.complete_broadcast_bsc(
+            draft_bsc,
+            ctx_bsc.lease_token,
+            Ok(bsc_tx_hash.clone()),
+            1,
+            1,
+            now_unix + 5,
+        ).unwrap();
+        assert_eq!(complete_bsc_res, broadcast::lifecycle::BroadcastOutcome::Success(bsc_tx_hash));
+
+        let _ = fs::remove_file(temp_storage);
+    }
+
+    #[test]
+    fn test_t79_native_recovery_serde_json_compatibility() {
+        use crate::wallet::broadcast::{
+            types::{BroadcastNetwork, TxLifecycleStatus, TxLifecycleRecord},
+        };
+
+        let temp_storage = std::env::temp_dir().join(format!("t79_coord_{}.json", LockoutManager::now_unix()));
+        let mut coord = broadcast::lifecycle::TxLifecycleCoordinator::default();
+        coord.set_storage_path(temp_storage.clone());
+        let now_unix = LockoutManager::now_unix();
+        let draft_id = "draft-btc-t79-serde";
+
+        coord.register_draft(draft_id, BroadcastNetwork::BitcoinSignet, now_unix).unwrap();
+        coord.record_signed_btc(
+            draft_id,
+            "0x7979",
+            "0200000001...",
+            "txid_t79_btc",
+            "wtxid_t79_btc",
+            vec![broadcast::types::ApprovedPrevout {
+                txid: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+                vout: 0,
+                value_satoshis: 19_000,
+                script_pubkey_hex: "0014...".into(),
+            }],
+            now_unix,
+        ).unwrap();
+
+        // Begin broadcast -> sets status to Broadcasting { draft_id, attempt: 1 }
+        let _ctx = coord.begin_broadcast_btc(draft_id, 1, now_unix).unwrap();
+
+        // Export records as returned by list_lifecycle_records
+        let records = coord.export_records();
+        assert_eq!(records.len(), 1);
+        let serialized_json = serde_json::to_string_pretty(&records[0]).unwrap();
+
+        // Verify JSON serialization exact camelCase keys required by frontend:
+        let val: serde_json::Value = serde_json::from_str(&serialized_json).unwrap();
+        assert_eq!(val["recordId"].as_str(), Some(draft_id));
+        assert_eq!(val["network"].as_str(), Some("bitcoin_signet"));
+        assert_eq!(val["expectedTxid"].as_str(), Some("txid_t79_btc"));
+        assert_eq!(val["status"]["status"].as_str(), Some("broadcasting"));
+        assert_eq!(val["status"]["details"]["attempt"].as_u64(), Some(1));
+
+        // Verify round-trip deserialization back to TxLifecycleRecord
+        let roundtrip: TxLifecycleRecord = serde_json::from_str(&serialized_json).unwrap();
+        assert_eq!(roundtrip.record_id, draft_id);
+        assert!(matches!(roundtrip.status, TxLifecycleStatus::Broadcasting { .. }));
 
         let _ = fs::remove_file(temp_storage);
     }

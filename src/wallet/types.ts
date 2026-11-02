@@ -133,6 +133,21 @@ export type TxLifecycleStatus =
   | { status: 'replaced'; details: { oldTxHash: string; newTxHash: string; reason: string } }
   | { status: 'reorgDetected'; details: { txHash: string; previousBlockHeight: number; previousBlockHash: string } };
 
+export interface TxLifecycleRecord {
+  recordId: string;
+  network: 'bitcoin_signet' | 'bsc_testnet';
+  txHash: string | null;
+  expectedTxHash: string | null;
+  rawTxHex: string | null;
+  payloadHash: string | null;
+  expectedTxid: string | null;
+  expectedWtxid: string | null;
+  status: TxLifecycleStatus;
+  createdAtUnix: number;
+  updatedAtUnix: number;
+  retryCount: number;
+}
+
 export const offlineStatus: WalletStatus = {
   exists: false,
   unlocked: false,

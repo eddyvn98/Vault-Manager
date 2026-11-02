@@ -19,6 +19,7 @@ import {
   BscSignedPreview,
   PreflightReport,
   TxLifecycleStatus,
+  TxLifecycleRecord,
   getErrorMessage,
 } from '../types';
 
@@ -51,21 +52,22 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
   const [isSigning, setIsSigning] = useState(false);
   const [isPreflighting, setIsPreflighting] = useState(false);
   const [isBroadcasting, setIsBroadcasting] = useState(false);
-  const [recoveredDraft, setRecoveredDraft] = useState<any | null>(null);
+  const [recoveredDraft, setRecoveredDraft] = useState<TxLifecycleRecord | null>(null);
+  const [activeTrackingId, setActiveTrackingId] = useState<string | null>(null);
 
-  const activeDraftId = btcPreview?.draftId || bscPreview?.draftId || recoveredDraft?.draft_id;
+  const activeDraftId = btcPreview?.draftId || bscPreview?.draftId || activeTrackingId;
   const isPollingRef = useRef(false);
 
   // Check on mount for recovered transactions after app restart
   useEffect(() => {
-    invoke<any[]>('list_lifecycle_records')
+    invoke<TxLifecycleRecord[]>('list_lifecycle_records')
       .then((records) => {
         if (Array.isArray(records) && records.length > 0) {
           const ongoing = records.find(r => 
             r.status && (
-              r.status.Broadcasting !== undefined ||
-              r.status.Pending !== undefined ||
-              (r.status.Failed && !r.status.Failed.permanent)
+              r.status.status === 'broadcasting' ||
+              r.status.status === 'pending' ||
+              (r.status.status === 'failed' && !r.status.details.permanent)
             )
           );
           if (ongoing) {
@@ -76,11 +78,11 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
       .catch((err) => console.error('Failed to query lifecycle records:', err));
   }, []);
 
-  // Poll lifecycle status once broadcasted (with overlap guard)
+  // Poll lifecycle status once broadcasted or when tracking a recovered draft
   useEffect(() => {
     let timer: number | null = null;
 
-    if (broadcastTxHash && activeDraftId) {
+    if (activeDraftId && (broadcastTxHash || activeTrackingId)) {
       const poll = async () => {
         if (isPollingRef.current) return;
         isPollingRef.current = true;
@@ -89,6 +91,16 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
             draftId: activeDraftId,
           });
           setLifecycle(status);
+          if (
+            status.status === 'pending' ||
+            status.status === 'confirmed' ||
+            status.status === 'dropped' ||
+            status.status === 'reorgDetected'
+          ) {
+            setBroadcastTxHash(status.details.txHash);
+          } else if (status.status === 'replaced') {
+            setBroadcastTxHash(status.details.newTxHash);
+          }
         } catch (e) {
           console.error('Lifecycle poll error:', e);
         } finally {
@@ -103,7 +115,7 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
     return () => {
       if (timer) clearInterval(timer);
     };
-  }, [broadcastTxHash, activeDraftId]);
+  }, [broadcastTxHash, activeDraftId, activeTrackingId]);
 
   const handlePrepare = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -289,7 +301,7 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
         )}
 
         {/* RECOVERY CARD AFTER RESTART */}
-        {recoveredDraft && !broadcastTxHash && (
+        {recoveredDraft && !broadcastTxHash && !activeTrackingId && (
           <div className="preview-card border-amber-500/40 bg-amber-950/20 mb-3">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -298,7 +310,7 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
                   <span>Phát hiện giao dịch chưa hoàn tất sau khi khởi động lại</span>
                 </div>
                 <div className="text-[11px] text-slate-300 font-mono mt-1">
-                  Draft: {recoveredDraft.draft_id} ({recoveredDraft.network}) · Trạng thái: {typeof recoveredDraft.status === 'object' ? Object.keys(recoveredDraft.status)[0] : recoveredDraft.status}
+                  Draft: {recoveredDraft.recordId} ({recoveredDraft.network}) · Trạng thái: {recoveredDraft.status.status}
                 </div>
               </div>
               <button
@@ -307,11 +319,25 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
                 onClick={async () => {
                   try {
                     setBusy(true);
+                    setActiveTrackingId(recoveredDraft.recordId);
                     const st = await invoke<TxLifecycleStatus>('query_transaction_lifecycle', {
-                      draftId: recoveredDraft.draft_id,
+                      draftId: recoveredDraft.recordId,
                     });
                     setLifecycle(st);
-                    setBroadcastTxHash(recoveredDraft.tx_hash || recoveredDraft.expected_txid || 'reconciled');
+                    if (
+                      st.status === 'pending' ||
+                      st.status === 'confirmed' ||
+                      st.status === 'dropped' ||
+                      st.status === 'reorgDetected'
+                    ) {
+                      setBroadcastTxHash(st.details.txHash);
+                    } else if (st.status === 'replaced') {
+                      setBroadcastTxHash(st.details.newTxHash);
+                    } else if (recoveredDraft.txHash) {
+                      setBroadcastTxHash(recoveredDraft.txHash);
+                    } else if (recoveredDraft.expectedTxid) {
+                      setBroadcastTxHash(recoveredDraft.expectedTxid);
+                    }
                   } catch (e) {
                     setError(getErrorMessage(e));
                   } finally {
