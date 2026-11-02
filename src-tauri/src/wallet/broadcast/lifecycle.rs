@@ -370,7 +370,20 @@ impl TxLifecycleCoordinator {
         max_retries: u32,
         now_unix: u64,
     ) -> Result<BroadcastOutcome, String> {
-        // 1. Check if the record already reached Pending or Confirmed (e.g. via concurrent on-chain polling during in-flight HTTP POST)
+        // 1. Strict lease authorization check:
+        // Caller MUST hold the currently active lease for this draft!
+        let is_valid_lease = match self.active_leases.get(draft_id) {
+            Some(&(active_tok, _)) => active_tok == lease_token,
+            None => false,
+        };
+        if !is_valid_lease {
+            return Err(format!(
+                "Stale or unauthorized broadcast lease #{} for draft '{}'",
+                lease_token, draft_id
+            ));
+        }
+
+        // 2. Check if the record already reached Pending or Confirmed (e.g. via concurrent on-chain polling during in-flight HTTP POST)
         let current_status = self.records.get(draft_id).map(|r| r.status.clone());
         if let Some(TxLifecycleStatus::Confirmed { ref tx_hash, .. }) = current_status {
             self.active_leases.remove(draft_id);
@@ -381,15 +394,6 @@ impl TxLifecycleCoordinator {
             // Clean up lease and return Success with the genuine hash, preventing false stale error
             self.active_leases.remove(draft_id);
             return Ok(BroadcastOutcome::Success(tx_hash.clone()));
-        }
-
-        // 2. Enforce lease validity: only the active lease holder can complete the broadcast
-        let is_valid_lease = match self.active_leases.get(draft_id) {
-            Some(&(active_tok, _)) => active_tok == lease_token,
-            None => false,
-        };
-        if !is_valid_lease {
-            return Err(format!("Stale or unauthorized broadcast lease #{} for draft '{}'", lease_token, draft_id));
         }
 
         match result {
@@ -554,7 +558,20 @@ impl TxLifecycleCoordinator {
         max_retries: u32,
         now_unix: u64,
     ) -> Result<BroadcastOutcome, String> {
-        // 1. Check if the record already reached Pending or Confirmed (e.g. via concurrent on-chain polling during in-flight HTTP POST)
+        // 1. Strict lease authorization check:
+        // Caller MUST hold the currently active lease for this draft!
+        let is_valid_lease = match self.active_leases.get(draft_id) {
+            Some(&(active_tok, _)) => active_tok == lease_token,
+            None => false,
+        };
+        if !is_valid_lease {
+            return Err(format!(
+                "Stale or unauthorized broadcast lease #{} for draft '{}'",
+                lease_token, draft_id
+            ));
+        }
+
+        // 2. Check if the record already reached Pending or Confirmed (e.g. via concurrent on-chain polling during in-flight HTTP POST)
         let current_status = self.records.get(draft_id).map(|r| r.status.clone());
         if let Some(TxLifecycleStatus::Confirmed { ref tx_hash, .. }) = current_status {
             self.active_leases.remove(draft_id);
@@ -564,15 +581,6 @@ impl TxLifecycleCoordinator {
             // Transaction already registered in mempool on-chain!
             self.active_leases.remove(draft_id);
             return Ok(BroadcastOutcome::Success(tx_hash.clone()));
-        }
-
-        // 2. Enforce lease validity: only the active lease holder can complete the broadcast
-        let is_valid_lease = match self.active_leases.get(draft_id) {
-            Some(&(active_tok, _)) => active_tok == lease_token,
-            None => false,
-        };
-        if !is_valid_lease {
-            return Err(format!("Stale or unauthorized broadcast lease #{} for draft '{}'", lease_token, draft_id));
         }
 
         match result {

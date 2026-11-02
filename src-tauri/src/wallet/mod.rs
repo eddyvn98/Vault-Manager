@@ -3211,7 +3211,20 @@ mod tests {
         let polled_st = coord.poll_btc_lifecycle(draft_btc, &mock_btc, now_unix + 2).unwrap();
         assert!(matches!(polled_st, TxLifecycleStatus::Pending { .. }));
 
-        // Now HTTP POST A finishes and calls complete_broadcast_btc with lease #1:
+        // Negative check: An unauthorized caller with bogus lease token (#99) while in Pending
+        // MUST BE REJECTED fail-closed and MUST NOT steal or delete the active lease!
+        let unauth_btc = coord.complete_broadcast_btc(
+            draft_btc,
+            99, // bogus unauthorized lease token
+            Ok("txid_t78_btc".into()),
+            1,
+            1,
+            now_unix + 3,
+        );
+        assert!(unauth_btc.is_err(), "Bogus lease token must be rejected fail-closed");
+        assert_eq!(coord.active_leases.get(draft_btc), Some(&(1, now_unix)));
+
+        // Now legitimate HTTP POST A finishes and calls complete_broadcast_btc with active lease #1:
         // MUST NOT RETURN STALE LEASE ERROR! Must return Success with genuine txid!
         let complete_res = coord.complete_broadcast_btc(
             draft_btc,
@@ -3249,6 +3262,18 @@ mod tests {
         mock_bsc.set_receipt(&bsc_tx_hash, BscReceiptStatus::Pending);
         let polled_bsc_st = coord.poll_bsc_lifecycle(draft_bsc, &mock_bsc, now_unix + 2).unwrap();
         assert!(matches!(polled_bsc_st, TxLifecycleStatus::Pending { .. }));
+
+        // Negative check: Bogus lease token #99 on BSC must be rejected fail-closed without modifying lease:
+        let unauth_bsc = coord.complete_broadcast_bsc(
+            draft_bsc,
+            99, // bogus unauthorized lease token
+            Ok(bsc_tx_hash.clone()),
+            1,
+            1,
+            now_unix + 3,
+        );
+        assert!(unauth_bsc.is_err(), "Bogus lease token must be rejected fail-closed on BSC");
+        assert_eq!(coord.active_leases.get(draft_bsc), Some(&(ctx_bsc.lease_token, now_unix)));
 
         // In-flight BSC POST finishes and completes -> returns Success with bsc_tx_hash!
         let complete_bsc_res = coord.complete_broadcast_bsc(
@@ -3312,6 +3337,89 @@ mod tests {
         let roundtrip: TxLifecycleRecord = serde_json::from_str(&serialized_json).unwrap();
         assert_eq!(roundtrip.record_id, draft_id);
         assert!(matches!(roundtrip.status, TxLifecycleStatus::Broadcasting { .. }));
+
+        // Comprehensive verification of all TxLifecycleStatus variant inner fields in camelCase:
+        let pending = TxLifecycleStatus::Pending {
+            tx_hash: "0xpending_hash".into(),
+            first_seen_unix: 1710000001,
+        };
+        let p_val: serde_json::Value = serde_json::to_value(&pending).unwrap();
+        assert_eq!(p_val["status"].as_str(), Some("pending"));
+        assert_eq!(p_val["details"]["txHash"].as_str(), Some("0xpending_hash"));
+        assert_eq!(p_val["details"]["firstSeenUnix"].as_u64(), Some(1710000001));
+        assert!(p_val["details"].get("tx_hash").is_none());
+
+        let confirmed = TxLifecycleStatus::Confirmed {
+            tx_hash: "0xconfirmed_hash".into(),
+            block_height: 850000,
+            block_hash: "00000000000000000001".into(),
+            confirmations: 6,
+        };
+        let c_val: serde_json::Value = serde_json::to_value(&confirmed).unwrap();
+        assert_eq!(c_val["status"].as_str(), Some("confirmed"));
+        assert_eq!(c_val["details"]["txHash"].as_str(), Some("0xconfirmed_hash"));
+        assert_eq!(c_val["details"]["blockHeight"].as_u64(), Some(850000));
+        assert_eq!(c_val["details"]["blockHash"].as_str(), Some("00000000000000000001"));
+        assert_eq!(c_val["details"]["confirmations"].as_u64(), Some(6));
+
+        let failed = TxLifecycleStatus::Failed {
+            stage: "broadcast".into(),
+            error_message: "RPC node timeout".into(),
+            permanent: false,
+        };
+        let f_val: serde_json::Value = serde_json::to_value(&failed).unwrap();
+        assert_eq!(f_val["status"].as_str(), Some("failed"));
+        assert_eq!(f_val["details"]["stage"].as_str(), Some("broadcast"));
+        assert_eq!(f_val["details"]["errorMessage"].as_str(), Some("RPC node timeout"));
+        assert_eq!(f_val["details"]["permanent"].as_bool(), Some(false));
+
+        let replaced = TxLifecycleStatus::Replaced {
+            old_tx_hash: "0xold".into(),
+            new_tx_hash: "0xnew".into(),
+            reason: "RBF fee bump".into(),
+        };
+        let r_val: serde_json::Value = serde_json::to_value(&replaced).unwrap();
+        assert_eq!(r_val["status"].as_str(), Some("replaced"));
+        assert_eq!(r_val["details"]["oldTxHash"].as_str(), Some("0xold"));
+        assert_eq!(r_val["details"]["newTxHash"].as_str(), Some("0xnew"));
+        assert_eq!(r_val["details"]["reason"].as_str(), Some("RBF fee bump"));
+
+        let dropped = TxLifecycleStatus::Dropped {
+            tx_hash: "0xdropped".into(),
+            reason: "mempool expiry".into(),
+        };
+        let d_val: serde_json::Value = serde_json::to_value(&dropped).unwrap();
+        assert_eq!(d_val["status"].as_str(), Some("dropped"));
+        assert_eq!(d_val["details"]["txHash"].as_str(), Some("0xdropped"));
+        assert_eq!(d_val["details"]["reason"].as_str(), Some("mempool expiry"));
+
+        let reorg = TxLifecycleStatus::ReorgDetected {
+            tx_hash: "0xreorg".into(),
+            previous_block_height: 849999,
+            previous_block_hash: "00000000prev".into(),
+        };
+        let ro_val: serde_json::Value = serde_json::to_value(&reorg).unwrap();
+        assert_eq!(ro_val["status"].as_str(), Some("reorgDetected"));
+        assert_eq!(ro_val["details"]["txHash"].as_str(), Some("0xreorg"));
+        assert_eq!(ro_val["details"]["previousBlockHeight"].as_u64(), Some(849999));
+        assert_eq!(ro_val["details"]["previousBlockHash"].as_str(), Some("00000000prev"));
+
+        // Backward compatibility verification: deserialize legacy snake_case JSON from disk
+        let legacy_json = r#"{
+            "status": "pending",
+            "details": {
+                "tx_hash": "0xlegacy_hash",
+                "first_seen_unix": 1700000000
+            }
+        }"#;
+        let legacy_deser: TxLifecycleStatus = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(
+            legacy_deser,
+            TxLifecycleStatus::Pending {
+                tx_hash: "0xlegacy_hash".into(),
+                first_seen_unix: 1700000000,
+            }
+        );
 
         let _ = fs::remove_file(temp_storage);
     }

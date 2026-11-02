@@ -32,47 +32,64 @@ impl BroadcastNetwork {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", content = "details", rename_all = "camelCase")]
+#[serde(tag = "status", content = "details", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum TxLifecycleStatus {
     DraftCreated {
+        #[serde(alias = "draft_id")]
         draft_id: String,
     },
     Signed {
+        #[serde(alias = "draft_id")]
         draft_id: String,
+        #[serde(alias = "payload_hash")]
         payload_hash: String,
+        #[serde(alias = "raw_tx_hex")]
         raw_tx_hex: String,
     },
     Broadcasting {
+        #[serde(alias = "draft_id")]
         draft_id: String,
         attempt: u32,
     },
     Pending {
+        #[serde(alias = "tx_hash")]
         tx_hash: String,
+        #[serde(alias = "first_seen_unix")]
         first_seen_unix: u64,
     },
     Confirmed {
+        #[serde(alias = "tx_hash")]
         tx_hash: String,
+        #[serde(alias = "block_height")]
         block_height: u64,
+        #[serde(alias = "block_hash")]
         block_hash: String,
         confirmations: u64,
     },
     Failed {
         stage: String,
+        #[serde(alias = "error_message")]
         error_message: String,
         permanent: bool,
     },
     Dropped {
+        #[serde(alias = "tx_hash")]
         tx_hash: String,
         reason: String,
     },
     Replaced {
+        #[serde(alias = "old_tx_hash")]
         old_tx_hash: String,
+        #[serde(alias = "new_tx_hash")]
         new_tx_hash: String,
         reason: String,
     },
     ReorgDetected {
+        #[serde(alias = "tx_hash")]
         tx_hash: String,
+        #[serde(alias = "previous_block_height")]
         previous_block_height: u64,
+        #[serde(alias = "previous_block_hash")]
         previous_block_hash: String,
     },
 }
@@ -173,24 +190,41 @@ pub struct ApprovedPrevout {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TxLifecycleRecord {
+    #[serde(alias = "record_id")]
     pub record_id: String,
     pub network: BroadcastNetwork,
+    #[serde(alias = "tx_hash")]
     pub tx_hash: Option<String>,
+    #[serde(alias = "expected_tx_hash")]
     pub expected_tx_hash: Option<String>,
+    #[serde(alias = "raw_tx_hex")]
     pub raw_tx_hex: Option<String>,
+    #[serde(alias = "payload_hash")]
     pub payload_hash: Option<String>,
+    #[serde(alias = "expected_txid")]
     pub expected_txid: Option<String>,
+    #[serde(alias = "expected_wtxid")]
     pub expected_wtxid: Option<String>,
+    #[serde(alias = "approved_prevouts")]
     pub approved_prevouts: Option<Vec<ApprovedPrevout>>,
+    #[serde(alias = "expected_sender")]
     pub expected_sender: Option<String>,
+    #[serde(alias = "expected_recipient")]
     pub expected_recipient: Option<String>,
+    #[serde(alias = "expected_amount_raw")]
     pub expected_amount_raw: Option<String>,
+    #[serde(alias = "expected_nonce")]
     pub expected_nonce: Option<u64>,
+    #[serde(alias = "expected_gas_limit")]
     pub expected_gas_limit: Option<u64>,
+    #[serde(alias = "expected_gas_price")]
     pub expected_gas_price: Option<String>,
     pub status: TxLifecycleStatus,
+    #[serde(alias = "created_at_unix")]
     pub created_at_unix: u64,
+    #[serde(alias = "updated_at_unix")]
     pub updated_at_unix: u64,
+    #[serde(alias = "retry_count")]
     pub retry_count: u32,
 }
 

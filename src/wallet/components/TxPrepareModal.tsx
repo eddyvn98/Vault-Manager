@@ -242,11 +242,114 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
     setTimeout(() => setCopied(false), 2000);
   };
 
+  const trackingNetwork = recoveredDraft
+    ? (recoveredDraft.network === 'bitcoin_signet' ? 'btc' : 'bsc')
+    : network;
+
   const explorerUrl =
     broadcastTxHash &&
-    (network === 'btc'
+    (trackingNetwork === 'btc'
       ? `https://mempool.space/signet/tx/${broadcastTxHash}`
       : `https://testnet.bscscan.com/tx/${broadcastTxHash}`);
+
+  const renderLifecycleTracker = () => (
+    <div className="preview-card border-sky-500/30 bg-sky-950/10">
+      <div className="flex justify-between items-center">
+        <span className="text-xs font-bold text-sky-400 flex items-center gap-2">
+          <Radio size={14} className="animate-pulse" /> Trạng thái phát sóng On-chain
+        </span>
+        {lifecycle && (
+          <span
+            className={`status-badge-${
+              lifecycle.status === 'confirmed'
+                ? 'confirmed'
+                : lifecycle.status === 'failed'
+                ? 'failed'
+                : 'pending'
+            }`}
+          >
+            {lifecycle.status === 'confirmed' && (
+              <>
+                <CheckCircle2 size={12} /> Đã xác nhận on-chain (
+                {lifecycle.details.confirmations} block)
+              </>
+            )}
+            {lifecycle.status === 'pending' && (
+              <>
+                <Loader2 size={12} className="animate-spin" /> Đang chờ thợ đào đóng block
+              </>
+            )}
+            {lifecycle.status === 'broadcasting' && (
+              <>
+                <Loader2 size={12} className="animate-spin" /> Đang gửi tới node testnet...
+              </>
+            )}
+            {lifecycle.status === 'failed' && (
+              <>
+                <AlertCircle size={12} /> Thất bại: {lifecycle.details.errorMessage}
+              </>
+            )}
+            {lifecycle.status === 'dropped' && (
+              <>
+                <AlertCircle size={12} /> Bị loại khỏi mempool: {lifecycle.details.reason}
+              </>
+            )}
+            {lifecycle.status === 'replaced' && (
+              <>
+                <AlertCircle size={12} /> Đã thay thế (RBF): {lifecycle.details.reason}
+              </>
+            )}
+            {lifecycle.status === 'reorgDetected' && (
+              <>
+                <AlertCircle size={12} /> Phát hiện Reorg chuỗi!
+              </>
+            )}
+          </span>
+        )}
+      </div>
+
+      {broadcastTxHash ? (
+        <div className="preview-row">
+          <span className="preview-label">Hash phát sóng:</span>
+          <div className="flex items-center gap-2">
+            <span className="preview-value text-xs text-sky-300 font-mono truncate max-w-[260px]">
+              {broadcastTxHash}
+            </span>
+            <button
+              type="button"
+              className="mini-action-btn"
+              onClick={() => copyPayload(broadcastTxHash)}
+            >
+              {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
+            </button>
+          </div>
+        </div>
+      ) : (
+        <div className="preview-row">
+          <span className="preview-label">Trạng thái:</span>
+          <span className="preview-value text-xs text-amber-300">
+            {lifecycle?.status === 'broadcasting'
+              ? 'Đang gửi tới node hoặc chờ polling xác nhận…'
+              : 'Đang theo dõi tiến trình on-chain…'}
+          </span>
+        </div>
+      )}
+
+      {explorerUrl && (
+        <div className="mt-1">
+          <a
+            href={explorerUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="text-xs text-sky-400 hover:text-sky-300 inline-flex items-center gap-1 font-semibold underline underline-offset-2"
+          >
+            Xem trên {trackingNetwork === 'btc' ? 'Mempool Signet Explorer' : 'BscScan Testnet'}
+            <ExternalLink size={12} />
+          </a>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div className="modal-backdrop">
@@ -351,8 +454,56 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
           </div>
         )}
 
+        {/* RECOVERED TRANSACTION TRACKER VIEW */}
+        {!btcPreview && !bscPreview && activeTrackingId && (
+          <div className="grid gap-3">
+            <div className="preview-card border-amber-500/30 bg-amber-950/10">
+              <div className="flex justify-between items-center">
+                <span className="chip status-badge-confirmed">
+                  Khôi phục sau sự cố / Khởi động lại
+                </span>
+                <span className="text-[11px] text-slate-400 font-mono">{activeTrackingId}</span>
+              </div>
+              <div className="preview-row mt-2">
+                <span className="preview-label">Mạng mục tiêu:</span>
+                <span className="preview-value text-xs uppercase font-semibold text-sky-400">
+                  {trackingNetwork === 'btc' ? 'Bitcoin Signet (BIP84)' : 'BSC Testnet (Chain ID 97)'}
+                </span>
+              </div>
+              {recoveredDraft?.expectedTxid && (
+                <div className="preview-row">
+                  <span className="preview-label">TxID dự kiến:</span>
+                  <span className="preview-value text-xs text-sky-300 font-mono">
+                    {recoveredDraft.expectedTxid}
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {renderLifecycleTracker()}
+
+            <div className="modal-actions">
+              <button
+                type="button"
+                className="subtle"
+                onClick={() => {
+                  setActiveTrackingId(null);
+                  setBroadcastTxHash(null);
+                  setLifecycle(null);
+                  setRecoveredDraft(null);
+                }}
+              >
+                Tạo giao dịch mới
+              </button>
+              <button type="button" onClick={onClose}>
+                Đóng
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* STEP 1: INPUT FORM */}
-        {!btcPreview && !bscPreview && (
+        {!btcPreview && !bscPreview && !activeTrackingId && (
           <form onSubmit={handlePrepare} className="grid gap-3">
             <label className="text-xs text-slate-400">
               Địa chỉ nhận ({network === 'btc' ? 'Signet tb1q...' : 'BSC Testnet 0x...'})
@@ -567,88 +718,7 @@ export default function TxPrepareModal({ onClose, defaultNetwork = 'btc' }: TxPr
             )}
 
             {/* BROADCAST & LIFECYCLE TRACKER */}
-            {broadcastTxHash && (
-              <div className="preview-card border-sky-500/30 bg-sky-950/10">
-                <div className="flex justify-between items-center">
-                  <span className="text-xs font-bold text-sky-400 flex items-center gap-2">
-                    <Radio size={14} className="animate-pulse" /> Trạng thái phát sóng On-chain
-                  </span>
-                  {lifecycle && (
-                    <span
-                      className={`status-badge-${
-                        lifecycle.status === 'confirmed'
-                          ? 'confirmed'
-                          : lifecycle.status === 'failed'
-                          ? 'failed'
-                          : 'pending'
-                      }`}
-                    >
-                      {lifecycle.status === 'confirmed' && (
-                        <>
-                          <CheckCircle2 size={12} /> Đã xác nhận on-chain (
-                          {lifecycle.details.confirmations} block)
-                        </>
-                      )}
-                      {lifecycle.status === 'pending' && (
-                        <>
-                          <Loader2 size={12} className="animate-spin" /> Đang chờ thợ đào đóng block
-                        </>
-                      )}
-                      {lifecycle.status === 'broadcasting' && (
-                        <>
-                          <Loader2 size={12} className="animate-spin" /> Đang gửi tới node testnet...
-                        </>
-                      )}
-                      {lifecycle.status === 'failed' && (
-                        <>
-                          <AlertCircle size={12} /> Thất bại: {lifecycle.details.errorMessage}
-                        </>
-                      )}
-                      {lifecycle.status === 'dropped' && (
-                        <>
-                          <AlertCircle size={12} /> Bị loại khỏi mempool: {lifecycle.details.reason}
-                        </>
-                      )}
-                      {lifecycle.status === 'reorgDetected' && (
-                        <>
-                          <AlertCircle size={12} /> Phát hiện Reorg chuỗi!
-                        </>
-                      )}
-                    </span>
-                  )}
-                </div>
-
-                <div className="preview-row">
-                  <span className="preview-label">Hash phát sóng:</span>
-                  <div className="flex items-center gap-2">
-                    <span className="preview-value text-xs text-sky-300 font-mono truncate max-w-[260px]">
-                      {broadcastTxHash}
-                    </span>
-                    <button
-                      type="button"
-                      className="mini-action-btn"
-                      onClick={() => copyPayload(broadcastTxHash)}
-                    >
-                      {copied ? <Check size={11} className="text-emerald-400" /> : <Copy size={11} />}
-                    </button>
-                  </div>
-                </div>
-
-                {explorerUrl && (
-                  <div className="mt-1">
-                    <a
-                      href={explorerUrl}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="text-xs text-sky-400 hover:text-sky-300 inline-flex items-center gap-1 font-semibold underline underline-offset-2"
-                    >
-                      Xem trên {network === 'btc' ? 'Mempool Signet Explorer' : 'BscScan Testnet'}
-                      <ExternalLink size={12} />
-                    </a>
-                  </div>
-                )}
-              </div>
-            )}
+            {(broadcastTxHash || lifecycle) && renderLifecycleTracker()}
 
             {/* ACTION BUTTONS */}
             <div className="modal-actions">
