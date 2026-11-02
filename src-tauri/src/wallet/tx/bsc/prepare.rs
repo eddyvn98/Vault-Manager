@@ -124,6 +124,7 @@ pub async fn prepare_bsc_testnet_tx(
         nonce: gas_info.nonce,
         gas_limit: gas_info.gas_limit,
         gas_price_gwei: gas_info.gas_price_gwei,
+        gas_price_wei: gas_info.gas_price_wei.to_string(),
         estimated_fee_bnb: gas_info.estimated_fee_bnb,
         calldata_hex,
         unsigned_tx_summary: unsigned_summary,

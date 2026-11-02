@@ -3,34 +3,77 @@ use bitcoin::{
     hashes::Hash,
     secp256k1::{Message, Secp256k1, SecretKey},
     sighash::{EcdsaSighashType, SighashCache},
-    Psbt, ScriptBuf, Witness,
+    OutPoint, Psbt, ScriptBuf, Witness,
 };
 
 use crate::wallet::tx::policy;
 
-/// Independently validate PSBT outputs, amounts, recipient, change, and fees before signing.
-/// Protects against malicious or tampered PSBTs attempting to divert funds, inflate fees, or tamper with SegWit amounts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ApprovedPrevout {
+    pub outpoint: OutPoint,
+    pub value_satoshis: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BtcSigningPolicy {
+    pub expected_recipient: ScriptBuf,
+    pub expected_amount_sat: u64,
+    pub expected_change_script: Option<ScriptBuf>,
+    pub approved_inputs: Vec<ApprovedPrevout>,
+}
+
+/// Independently validate PSBT inputs, outputs, amounts, recipient, change, and fees against approved draft policy.
+/// Guarantees:
+/// 1. Every input matches an approved OutPoint (txid:vout) and EXACT satoshi value (prevents even 1-sat fee spoofing).
+/// 2. Total input = sum of approved inputs.
+/// 3. Recipient output matches exact approved script and exact amount.
+/// 4. Any change output matches approved change script. No unrecognized outputs allowed.
+/// 5. Fee = total_in - total_out strictly adheres to policy (fee <= 50,000 sats, fee ratio < 25%).
 pub fn validate_psbt_before_signing(
     psbt: &Psbt,
-    expected_recipient: &ScriptBuf,
-    expected_amount_sat: u64,
-    expected_change_script: Option<&ScriptBuf>,
+    policy: &BtcSigningPolicy,
 ) -> Result<u64, String> {
     if psbt.inputs.is_empty() {
         return Err("PSBT has no inputs".into());
     }
 
+    if psbt.inputs.len() != policy.approved_inputs.len() {
+        return Err(format!(
+            "PSBT input count ({}) does not match approved input count ({})",
+            psbt.inputs.len(),
+            policy.approved_inputs.len()
+        ));
+    }
+
     let mut total_in_sat = 0u64;
+
+    // Verify every input against approved inputs list
     for (i, input) in psbt.inputs.iter().enumerate() {
         let utxo = input
             .witness_utxo
             .as_ref()
             .ok_or_else(|| format!("Input {} missing witness_utxo", i))?;
-        if utxo.value.to_sat() == 0 {
-            return Err(format!("Input {} has zero amount", i));
+
+        let txin = &psbt.unsigned_tx.input[i];
+        let approved = &policy.approved_inputs[i];
+
+        if txin.previous_output != approved.outpoint {
+            return Err(format!(
+                "Input {} OutPoint mismatch: expected {}, found {}",
+                i, approved.outpoint, txin.previous_output
+            ));
         }
+
+        let input_val = utxo.value.to_sat();
+        if input_val != approved.value_satoshis {
+            return Err(format!(
+                "Input {} value mismatch: expected {} sats, found {} sats (tampering detected)",
+                i, approved.value_satoshis, input_val
+            ));
+        }
+
         total_in_sat = total_in_sat
-            .checked_add(utxo.value.to_sat())
+            .checked_add(input_val)
             .ok_or_else(|| "Input sum overflow".to_string())?;
     }
 
@@ -43,16 +86,16 @@ pub fn validate_psbt_before_signing(
             .checked_add(out_val)
             .ok_or_else(|| "Output sum overflow".to_string())?;
 
-        if &output.script_pubkey == expected_recipient {
-            if out_val == expected_amount_sat {
+        if output.script_pubkey == policy.expected_recipient {
+            if out_val == policy.expected_amount_sat {
                 recipient_found = true;
             } else {
                 return Err(format!(
                     "Output {} matches recipient script but amount mismatch: expected {}, found {}",
-                    i, expected_amount_sat, out_val
+                    i, policy.expected_amount_sat, out_val
                 ));
             }
-        } else if let Some(change_script) = expected_change_script {
+        } else if let Some(ref change_script) = policy.expected_change_script {
             if &output.script_pubkey != change_script {
                 return Err(format!(
                     "Output {} has unexpected script (neither approved recipient nor approved change)",
@@ -76,7 +119,7 @@ pub fn validate_psbt_before_signing(
     }
 
     let fee_sat = total_in_sat - total_out_sat;
-    policy::validate_btc_fee(expected_amount_sat, fee_sat)?;
+    policy::validate_btc_fee(policy.expected_amount_sat, fee_sat)?;
 
     Ok(fee_sat)
 }
@@ -168,6 +211,26 @@ pub fn finalize_p2wpkh_psbt_input(
     Ok(())
 }
 
+/// Secure pre-sign verified workflow: Validates PSBT against policy FIRST,
+/// and only proceeds to signing and finalizing all inputs if validation passes.
+pub fn sign_and_finalize_verified_psbt(
+    psbt: &mut Psbt,
+    policy: &BtcSigningPolicy,
+    secp: &Secp256k1<secp256k1::All>,
+    privkey: &SecretKey,
+) -> Result<u64, String> {
+    // 1. Mandatory pre-signing validation
+    let fee = validate_psbt_before_signing(psbt, policy)?;
+
+    // 2. Sign and finalize every input per BIP-174
+    for i in 0..psbt.inputs.len() {
+        sign_p2wpkh_psbt_input(psbt, i, secp, privkey)?;
+        finalize_p2wpkh_psbt_input(psbt, i)?;
+    }
+
+    Ok(fee)
+}
+
 /// Cryptographically verifies that a P2WPKH input in a PSBT has a valid BIP-143 signature.
 pub fn verify_p2wpkh_psbt_input(
     psbt: &Psbt,
@@ -230,12 +293,12 @@ pub fn verify_p2wpkh_psbt_input(
 mod tests {
     use super::*;
     use bitcoin::{
-        absolute::LockTime, transaction::Version, Amount, OutPoint, Sequence,
+        absolute::LockTime, transaction::Version, Amount, Sequence,
         Transaction, TxIn, TxOut, Txid,
     };
     use std::str::FromStr;
 
-    fn build_fixture_psbt() -> (Psbt, SecretKey, ScriptBuf, ScriptBuf, u64, u64) {
+    fn build_fixture_psbt() -> (Psbt, SecretKey, BtcSigningPolicy) {
         let secp = Secp256k1::new();
         let privkey = SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001").unwrap();
         let pubkey = privkey.public_key(&secp);
@@ -251,10 +314,11 @@ mod tests {
         let change_script = wallet_script.clone();
 
         let prev_txid = Txid::from_str("0101010101010101010101010101010101010101010101010101010101010101").unwrap();
+        let prevout_point = OutPoint::new(prev_txid, 0);
         let prevout_value = Amount::from_sat(50_000);
 
         let tx_in = TxIn {
-            previous_output: OutPoint::new(prev_txid, 0),
+            previous_output: prevout_point,
             script_sig: ScriptBuf::new(),
             sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
             witness: Witness::new(),
@@ -286,109 +350,106 @@ mod tests {
             script_pubkey: wallet_script,
         });
 
-        (psbt, privkey, recipient_script, change_script, send_amount, 2_000)
+        let policy = BtcSigningPolicy {
+            expected_recipient: recipient_script,
+            expected_amount_sat: send_amount,
+            expected_change_script: Some(change_script),
+            approved_inputs: vec![ApprovedPrevout {
+                outpoint: prevout_point,
+                value_satoshis: 50_000,
+            }],
+        };
+
+        (psbt, privkey, policy)
     }
 
     #[test]
     fn it02_psbt_fixture_input_output_balance_and_signing() {
         let secp = Secp256k1::new();
-        let (mut psbt, privkey, recipient_script, change_script, send_amount, expected_fee) =
-            build_fixture_psbt();
+        let (mut psbt, privkey, policy) = build_fixture_psbt();
 
-        // 1. Pre-signing validation: verify balance: sum(input) == sum(output) + fee
-        let fee = validate_psbt_before_signing(
-            &psbt,
-            &recipient_script,
-            send_amount,
-            Some(&change_script),
-        )
-        .expect("Pre-signing validation must pass on valid fixture");
-        assert_eq!(fee, expected_fee, "Fee must equal 2000 sats (50k - 48k)");
+        // 1. Unified pre-signing validation & BIP-174 signing/finalization
+        let fee = sign_and_finalize_verified_psbt(&mut psbt, &policy, &secp, &privkey)
+            .expect("Signing verified PSBT must succeed");
+        assert_eq!(fee, 2000, "Fee must equal 2000 sats (50k - 48k)");
 
-        // 2. BIP-174 Sign input: adds partial_sigs
-        sign_p2wpkh_psbt_input(&mut psbt, 0, &secp, &privkey)
-            .expect("Must sign P2WPKH input");
-        assert_eq!(psbt.inputs[0].partial_sigs.len(), 1);
-        assert!(psbt.inputs[0].final_script_witness.is_none());
-
-        // 3. Finalize input: moves partial_sigs to final_script_witness
-        finalize_p2wpkh_psbt_input(&mut psbt, 0).expect("Must finalize input");
-        assert_eq!(psbt.inputs[0].partial_sigs.len(), 0);
+        // 2. Verify witness is generated
         assert!(psbt.inputs[0].final_script_witness.is_some());
+        assert_eq!(psbt.inputs[0].partial_sigs.len(), 0);
 
-        // 4. Verify signature on untampered transaction
+        // 3. Verify signature on untampered transaction
         verify_p2wpkh_psbt_input(&psbt, 0, &secp).expect("Witness must be cryptographically valid");
     }
 
     #[test]
-    fn it03_psbt_pre_sign_tamper_rejections_and_witness_integrity() {
+    fn it03_psbt_pre_sign_tamper_rejections_and_sub_satoshi_integrity() {
         let secp = Secp256k1::new();
-        let (psbt, privkey, recipient_script, change_script, send_amount, _) =
-            build_fixture_psbt();
+        let (psbt, privkey, policy) = build_fixture_psbt();
 
         // 1. TAMPER A: Diverting recipient script
         let mut tampered_recipient = psbt.clone();
         let attacker_script = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros());
         tampered_recipient.unsigned_tx.output[0].script_pubkey = attacker_script;
-        let res_tamper_rec = validate_psbt_before_signing(
-            &tampered_recipient,
-            &recipient_script,
-            send_amount,
-            Some(&change_script),
-        );
+        let res_tamper_rec = validate_psbt_before_signing(&tampered_recipient, &policy);
         assert!(
             res_tamper_rec.is_err(),
             "Signer must reject PSBT when recipient script was altered"
         );
 
-        // 2. TAMPER B: Inflating recipient amount (e.g. 30,000 -> 35,000)
+        // 2. TAMPER B: Inflating recipient amount (e.g. 30,000 -> 30,001 or 35,000)
         let mut tampered_amount = psbt.clone();
-        tampered_amount.unsigned_tx.output[0].value = Amount::from_sat(35_000);
-        let res_tamper_amt = validate_psbt_before_signing(
-            &tampered_amount,
-            &recipient_script,
-            send_amount,
-            Some(&change_script),
-        );
+        tampered_amount.unsigned_tx.output[0].value = Amount::from_sat(30_001);
+        let res_tamper_amt = validate_psbt_before_signing(&tampered_amount, &policy);
         assert!(
             res_tamper_amt.is_err(),
-            "Signer must reject PSBT when recipient amount was altered"
+            "Signer must reject PSBT even on 1-sat discrepancy in recipient amount"
         );
 
         // 3. TAMPER C: Diverting change output
         let mut tampered_change = psbt.clone();
         let attacker_change = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros());
         tampered_change.unsigned_tx.output[1].script_pubkey = attacker_change;
-        let res_tamper_change = validate_psbt_before_signing(
-            &tampered_change,
-            &recipient_script,
-            send_amount,
-            Some(&change_script),
-        );
+        let res_tamper_change = validate_psbt_before_signing(&tampered_change, &policy);
         assert!(
             res_tamper_change.is_err(),
             "Signer must reject PSBT when change address was altered"
         );
 
-        // 4. TAMPER D: Inflating UTXO value (Fee spoofing attack: claiming UTXO has 500,000 instead of 50,000)
-        let mut tampered_utxo = psbt.clone();
-        tampered_utxo.inputs[0].witness_utxo.as_mut().unwrap().value = Amount::from_sat(500_000);
-        // This causes fee calculation to jump to 452,000 sats, which violates policy cap!
-        let res_tamper_utxo = validate_psbt_before_signing(
-            &tampered_utxo,
-            &recipient_script,
-            send_amount,
-            Some(&change_script),
-        );
+        // 4. TAMPER D (SUB-SATOSHI / 1-SAT PREVOUT TAMPERING):
+        // Attacker claims UTXO has 50,001 sats instead of 50,000 (+1 satoshi discrepancy).
+        // Total fee would be 2,001 sats (which by itself is <= 50,000 fee cap).
+        // BUT because validator checks against approved_inputs, it MUST REJECT!
+        let mut tampered_1sat_utxo = psbt.clone();
+        tampered_1sat_utxo.inputs[0].witness_utxo.as_mut().unwrap().value = Amount::from_sat(50_001);
+        let res_1sat = validate_psbt_before_signing(&tampered_1sat_utxo, &policy);
         assert!(
-            res_tamper_utxo.is_err(),
-            "Signer must reject PSBT when fee policy is violated"
+            res_1sat.is_err(),
+            "Signer must reject PSBT when UTXO amount differs by even 1 satoshi from approved inputs"
+        );
+        let err_msg = res_1sat.unwrap_err();
+        assert!(err_msg.contains("Input 0 value mismatch"), "Error message must specify value mismatch: {}", err_msg);
+
+        // 5. TAMPER E: OutPoint vout tampering (trying to spend vout 1 instead of vout 0)
+        let mut tampered_outpoint = psbt.clone();
+        tampered_outpoint.unsigned_tx.input[0].previous_output.vout = 1;
+        let res_outpoint = validate_psbt_before_signing(&tampered_outpoint, &policy);
+        assert!(
+            res_outpoint.is_err(),
+            "Signer must reject PSBT when OutPoint does not match approved input"
         );
 
-        // 5. TAMPER E: Tampering after signing must be caught by witness verifier
+        // 6. MANDATORY PRE-SIGN ENFORCEMENT:
+        // Attempting to call sign_and_finalize_verified_psbt on any tampered PSBT fails immediately
+        let mut tampered_sign_attempt = tampered_1sat_utxo.clone();
+        let sign_attempt_res = sign_and_finalize_verified_psbt(&mut tampered_sign_attempt, &policy, &secp, &privkey);
+        assert!(
+            sign_attempt_res.is_err(),
+            "sign_and_finalize_verified_psbt must refuse to sign when validation fails"
+        );
+
+        // 7. TAMPER G: Tampering after signing must be caught by witness verifier
         let mut signed_psbt = psbt.clone();
-        sign_p2wpkh_psbt_input(&mut signed_psbt, 0, &secp, &privkey).unwrap();
-        finalize_p2wpkh_psbt_input(&mut signed_psbt, 0).unwrap();
+        sign_and_finalize_verified_psbt(&mut signed_psbt, &policy, &secp, &privkey).unwrap();
 
         // Altering output value after signing
         let mut tampered_post_sign = signed_psbt.clone();

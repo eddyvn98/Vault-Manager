@@ -44,6 +44,7 @@ pub struct BscTxPreview {
     pub nonce: u64,
     pub gas_limit: u64,
     pub gas_price_gwei: String,
+    pub gas_price_wei: String,
     pub estimated_fee_bnb: String,
     pub calldata_hex: String,
     pub unsigned_tx_summary: String,

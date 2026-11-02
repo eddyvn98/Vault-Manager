@@ -51,6 +51,11 @@ impl SessionState {
             .as_ref()
             .ok_or_else(|| "No active transaction draft found".to_string())?;
 
+        if draft.session_epoch != self.session_epoch {
+            self.active_draft = None;
+            return Err("Session epoch mismatch: draft was created in a previous session".into());
+        }
+
         if draft.draft_id != draft_id {
             return Err("Draft ID mismatch: another draft is active".into());
         }
@@ -494,7 +499,7 @@ pub async fn prepare_bsc_transaction(
         preview.amount_raw,
         preview.nonce,
         preview.gas_limit,
-        preview.gas_price_gwei
+        preview.gas_price_wei
     );
     let mut hasher = Keccak::v256();
     let mut hash = [0u8; 32];
@@ -537,11 +542,19 @@ pub fn reset_wallet(
         return Err(format!("Authentication failed: {}", e));
     }
 
-    fs::remove_file(&file).map_err(|_| "Cannot remove vault file")?;
+    fs::remove_file(&file).map_err(|e| format!("Cannot remove vault file: {}", e))?;
     if let Ok(app_dir) = app.path().app_data_dir() {
         let bdk_db = app_dir.join("bdk_signet.sqlite3");
         if bdk_db.exists() {
-            let _ = fs::remove_file(bdk_db);
+            fs::remove_file(&bdk_db).map_err(|e| format!("Cannot remove BDK database: {}", e))?;
+        }
+        let bdk_shm = app_dir.join("bdk_signet.sqlite3-shm");
+        if bdk_shm.exists() {
+            let _ = fs::remove_file(bdk_shm);
+        }
+        let bdk_wal = app_dir.join("bdk_signet.sqlite3-wal");
+        if bdk_wal.exists() {
+            let _ = fs::remove_file(bdk_wal);
         }
     }
     mgr.record_success();
@@ -651,6 +664,7 @@ mod tests {
     #[test]
     fn it05_draft_verification_expiration_and_payload_integrity() {
         let mut session = SessionState::default();
+        session.session_epoch = 1;
         let now = LockoutManager::now_unix();
 
         // 1. Setup active draft
@@ -691,5 +705,94 @@ mod tests {
         let err_expired = session.verify_and_consume_draft("draft-expired", "0x1111");
         assert!(err_expired.is_err());
         assert!(session.active_draft.is_none(), "Expired draft must be cleared");
+
+        // 6. Session epoch mismatch (e.g. wallet was locked & re-opened) -> error
+        let draft_epoch1 = ActiveDraft {
+            draft_id: "draft-epoch1".into(),
+            session_epoch: 1,
+            network: "Bitcoin Signet".into(),
+            payload_hash: "0x2222".into(),
+            expires_at_unix: now + 300,
+        };
+        session.active_draft = Some(draft_epoch1);
+        session.session_epoch = 2; // Session epoch incremented due to lock/unlock!
+        let err_epoch = session.verify_and_consume_draft("draft-epoch1", "0x2222");
+        assert!(err_epoch.is_err());
+        assert!(err_epoch.unwrap_err().contains("Session epoch mismatch"));
+        assert!(session.active_draft.is_none(), "Stale epoch draft must be cleared");
+    }
+
+    #[tokio::test]
+    async fn it05_concurrent_async_tasks_session_epoch_isolation() {
+        use std::sync::Arc;
+        let session_state = Arc::new(Mutex::new(SessionState::default()));
+
+        // Unlock wallet at epoch 0
+        {
+            let mut s = session_state.lock().unwrap();
+            s.mnemonic = Some(Zeroizing::new("test-mnemonic".into()));
+            s.last_activity = Some(Instant::now());
+            s.session_epoch = 0;
+        }
+
+        // Simulate Slow Task 1 (started at epoch 0)
+        let s_clone1 = Arc::clone(&session_state);
+        let task1 = tokio::spawn(async move {
+            let initial_epoch = 0;
+            // Simulate slow RPC latency
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+            let mut s = s_clone1.lock().unwrap();
+            if !check_and_apply_auto_lock(&mut s) || s.session_epoch != initial_epoch || s.mnemonic.is_none() {
+                return Err("Stale task rejected".to_string());
+            }
+            s.active_draft = Some(ActiveDraft {
+                draft_id: "draft-task1".into(),
+                session_epoch: initial_epoch,
+                network: "Bitcoin Signet".into(),
+                payload_hash: "0xhash1".into(),
+                expires_at_unix: LockoutManager::now_unix() + 300,
+            });
+            Ok(())
+        });
+
+        // Meanwhile, wallet is locked and re-unlocked at epoch 1
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        {
+            let mut s = session_state.lock().unwrap();
+            s.mnemonic = None;
+            s.session_epoch = 1; // Locked
+            s.mnemonic = Some(Zeroizing::new("test-mnemonic-epoch1".into()));
+            s.last_activity = Some(Instant::now()); // Unlocked at epoch 1
+        }
+
+        // Fast Task 2 runs at epoch 1
+        let s_clone2 = Arc::clone(&session_state);
+        let task2 = tokio::spawn(async move {
+            let initial_epoch = 1;
+            let mut s = s_clone2.lock().unwrap();
+            if !check_and_apply_auto_lock(&mut s) || s.session_epoch != initial_epoch || s.mnemonic.is_none() {
+                return Err("Stale task rejected".to_string());
+            }
+            s.active_draft = Some(ActiveDraft {
+                draft_id: "draft-task2".into(),
+                session_epoch: initial_epoch,
+                network: "Bitcoin Signet".into(),
+                payload_hash: "0xhash2".into(),
+                expires_at_unix: LockoutManager::now_unix() + 300,
+            });
+            Ok(())
+        });
+
+        let res2 = task2.await.unwrap();
+        assert!(res2.is_ok());
+
+        let res1 = task1.await.unwrap();
+        assert!(res1.is_err(), "Task 1 from epoch 0 must be rejected");
+
+        // Verify that Task 2 draft in epoch 1 is fully intact and was NOT clobbered by Task 1
+        let mut s = session_state.lock().unwrap();
+        let consumed = s.verify_and_consume_draft("draft-task2", "0xhash2");
+        assert!(consumed.is_ok(), "Task 2 draft must be intact and consumable in epoch 1");
     }
 }
