@@ -1,13 +1,12 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use bdk_esplora::{esplora_client::Builder as EsploraBuilder, EsploraAsyncExt};
-use bdk_wallet::Wallet;
-use bitcoin::{Amount, FeeRate, Network};
+use bitcoin::{Address, Amount, FeeRate, Network};
 use rand::RngCore;
 
 use crate::wallet::{
     blockchain,
     tx::{
-        btc::descriptors,
+        btc::{descriptors, store},
         policy,
         types::{BtcTxPreview, UtxoInfo},
     },
@@ -18,6 +17,7 @@ pub async fn prepare_signet_tx(
     recipient: &str,
     amount_satoshis: u64,
     fee_rate_opt: Option<u64>,
+    db_path: Option<&std::path::Path>,
 ) -> Result<BtcTxPreview, String> {
     // 1. Validate inputs and policies
     let recipient_addr = policy::validate_btc_signet_recipient(recipient)?;
@@ -33,11 +33,8 @@ pub async fn prepare_signet_tx(
     // 2. Derive BIP84 watch-only descriptors (no private keys in descriptor)
     let desc = descriptors::derive_signet_bip84_descriptors(mnemonic)?;
 
-    // 3. Initialize BDK Wallet
-    let mut wallet = Wallet::create(desc.receive_descriptor, desc.change_descriptor)
-        .network(Network::Signet)
-        .create_wallet_no_persist()
-        .map_err(|e| format!("Failed to initialize BDK wallet: {}", e))?;
+    // 3. Initialize BDK Wallet with SQLite persistence
+    let (mut wallet, mut conn) = store::open_or_init_wallet(db_path, &desc, Network::Signet)?;
 
     // 4. Sync chain state and UTXOs using bdk_esplora
     let esplora_client = EsploraBuilder::new("https://mempool.space/signet/api")
@@ -54,6 +51,10 @@ pub async fn prepare_signet_tx(
         .apply_update(scan_update)
         .map_err(|e| format!("Failed to apply blockchain update to BDK wallet: {}", e))?;
 
+    wallet
+        .persist(&mut conn)
+        .map_err(|e| format!("Failed to persist BDK wallet after scan: {}", e))?;
+
     // 5. Build transaction using BDK's native transaction builder
     let mut builder = wallet.build_tx();
     builder
@@ -63,6 +64,10 @@ pub async fn prepare_signet_tx(
     let psbt = builder
         .finish()
         .map_err(|e| format!("BDK transaction build failed: {}", e))?;
+
+    wallet
+        .persist(&mut conn)
+        .map_err(|e| format!("Failed to persist BDK wallet after tx build: {}", e))?;
 
     // 6. Verify Fee Policies
     let fee = wallet
@@ -77,14 +82,14 @@ pub async fn prepare_signet_tx(
     for (i, input) in psbt.inputs.iter().enumerate() {
         if let Some(prevout) = &input.witness_utxo {
             let txin = &psbt.unsigned_tx.input[i];
+            let utxo_address = Address::from_script(&prevout.script_pubkey, Network::Signet)
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "unknown".to_string());
             selected_utxos.push(UtxoInfo {
                 txid: txin.previous_output.txid.to_string(),
                 vout: txin.previous_output.vout,
                 value_satoshis: prevout.value.to_sat(),
-                address: wallet
-                    .peek_address(bdk_wallet::KeychainKind::External, 0)
-                    .address
-                    .to_string(),
+                address: utxo_address,
             });
         }
     }
@@ -144,7 +149,7 @@ mod tests {
         let mnemonic = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
         let desc = descriptors::derive_signet_bip84_descriptors(mnemonic).unwrap();
 
-        let wallet = Wallet::create(desc.receive_descriptor, desc.change_descriptor)
+        let wallet = bdk_wallet::Wallet::create(desc.receive_descriptor, desc.change_descriptor)
             .network(Network::Signet)
             .create_wallet_no_persist();
 
@@ -161,6 +166,7 @@ mod tests {
             "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
             10_000,
             Some(2),
+            None,
         ).await;
         assert!(res_mainnet.is_err());
 
@@ -170,6 +176,7 @@ mod tests {
             "tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx",
             100,
             Some(2),
+            None,
         ).await;
         assert!(res_dust.is_err());
     }

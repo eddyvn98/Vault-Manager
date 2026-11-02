@@ -39,6 +39,37 @@ pub struct SessionState {
     pub session_epoch: u64,
 }
 
+impl SessionState {
+    #[allow(dead_code)]
+    pub fn verify_and_consume_draft(
+        &mut self,
+        draft_id: &str,
+        expected_payload_hash: &str,
+    ) -> Result<ActiveDraft, String> {
+        let draft = self
+            .active_draft
+            .as_ref()
+            .ok_or_else(|| "No active transaction draft found".to_string())?;
+
+        if draft.draft_id != draft_id {
+            return Err("Draft ID mismatch: another draft is active".into());
+        }
+
+        if draft.payload_hash != expected_payload_hash {
+            return Err("Payload hash mismatch: transaction parameters have been altered".into());
+        }
+
+        let now = LockoutManager::now_unix();
+        if now > draft.expires_at_unix {
+            self.active_draft = None;
+            return Err("Transaction draft has expired".into());
+        }
+
+        let consumed = self.active_draft.take().unwrap();
+        Ok(consumed)
+    }
+}
+
 pub struct WalletSession {
     pub session: Mutex<SessionState>,
 }
@@ -366,6 +397,7 @@ pub async fn query_bsc_balance(
 
 #[tauri::command]
 pub async fn prepare_btc_transaction(
+    app: AppHandle,
     state: State<'_, WalletSession>,
     recipient: String,
     amount_satoshis: u64,
@@ -383,8 +415,14 @@ pub async fn prepare_btc_transaction(
         (m.clone(), session.session_epoch)
     };
 
+    let app_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to resolve app data directory: {}", e))?;
+    let db_path = app_dir.join("bdk_signet.sqlite3");
+
     let preview =
-        tx::btc::prepare::prepare_signet_tx(&mnemonic, &recipient, amount_satoshis, fee_rate_sat_vb)
+        tx::btc::prepare::prepare_signet_tx(&mnemonic, &recipient, amount_satoshis, fee_rate_sat_vb, Some(&db_path))
             .await?;
 
     let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
@@ -447,9 +485,20 @@ pub async fn prepare_bsc_transaction(
         return Err("Wallet was locked, reset, or session expired during transaction preparation. Stale draft discarded.".into());
     }
 
+    // Canonical representation covering all critical transaction parameters
+    let canonical = format!(
+        "bsc:{}:{}:{}:{}:{}:{}:{}",
+        preview.chain_id,
+        preview.token_contract.as_deref().unwrap_or("none").to_lowercase(),
+        preview.recipient_address.to_lowercase(),
+        preview.amount_raw,
+        preview.nonce,
+        preview.gas_limit,
+        preview.gas_price_gwei
+    );
     let mut hasher = Keccak::v256();
     let mut hash = [0u8; 32];
-    hasher.update(preview.calldata_hex.as_bytes());
+    hasher.update(canonical.as_bytes());
     hasher.finalize(&mut hash);
     let payload_hash = format!("0x{}", hex::encode(hash));
 
@@ -489,6 +538,12 @@ pub fn reset_wallet(
     }
 
     fs::remove_file(&file).map_err(|_| "Cannot remove vault file")?;
+    if let Ok(app_dir) = app.path().app_data_dir() {
+        let bdk_db = app_dir.join("bdk_signet.sqlite3");
+        if bdk_db.exists() {
+            let _ = fs::remove_file(bdk_db);
+        }
+    }
     mgr.record_success();
 
     let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
@@ -591,5 +646,50 @@ mod tests {
         // Critically, active_draft must remain intact for epoch 2!
         assert!(session.active_draft.is_some());
         assert_eq!(session.active_draft.unwrap().draft_id, "draft-btc-valid-epoch-2");
+    }
+
+    #[test]
+    fn it05_draft_verification_expiration_and_payload_integrity() {
+        let mut session = SessionState::default();
+        let now = LockoutManager::now_unix();
+
+        // 1. Setup active draft
+        let draft = ActiveDraft {
+            draft_id: "draft-123".into(),
+            session_epoch: 1,
+            network: "Bitcoin Signet".into(),
+            payload_hash: "0xabcdef123456".into(),
+            expires_at_unix: now + 300,
+        };
+        session.active_draft = Some(draft);
+
+        // 2. Draft ID mismatch -> error, active_draft preserved
+        let err_id = session.verify_and_consume_draft("draft-999", "0xabcdef123456");
+        assert!(err_id.is_err());
+        assert!(session.active_draft.is_some());
+
+        // 3. Payload hash mismatch (tampered payload) -> error, active_draft preserved
+        let err_payload = session.verify_and_consume_draft("draft-123", "0xtamperedhash");
+        assert!(err_payload.is_err());
+        assert!(session.active_draft.is_some());
+
+        // 4. Valid draft consumption -> success, draft consumed
+        let consumed = session.verify_and_consume_draft("draft-123", "0xabcdef123456");
+        assert!(consumed.is_ok());
+        assert_eq!(consumed.unwrap().draft_id, "draft-123");
+        assert!(session.active_draft.is_none());
+
+        // 5. Expired draft -> error, active_draft cleared
+        let expired_draft = ActiveDraft {
+            draft_id: "draft-expired".into(),
+            session_epoch: 1,
+            network: "Bitcoin Signet".into(),
+            payload_hash: "0x1111".into(),
+            expires_at_unix: now - 10, // Expired 10 seconds ago
+        };
+        session.active_draft = Some(expired_draft);
+        let err_expired = session.verify_and_consume_draft("draft-expired", "0x1111");
+        assert!(err_expired.is_err());
+        assert!(session.active_draft.is_none(), "Expired draft must be cleared");
     }
 }

@@ -220,10 +220,131 @@ impl Eip155SignedTransaction {
     }
 }
 
+/// Validate transaction against approved policy, contract, calldata, and authorized sender address before signing.
+pub fn validate_and_sign_bsc_tx(
+    tx: &Eip155Transaction,
+    expected_chain_id: u64,
+    expected_to: &str,
+    expected_data: &[u8],
+    expected_sender: &str,
+    secp: &Secp256k1<secp256k1::All>,
+    secret_key: &SecretKey,
+) -> Result<Eip155SignedTransaction, String> {
+    if tx.chain_id != expected_chain_id {
+        return Err(format!(
+            "Chain ID mismatch: expected {}, got {}",
+            expected_chain_id, tx.chain_id
+        ));
+    }
+
+    if tx.to.to_lowercase() != expected_to.to_lowercase() {
+        return Err(format!(
+            "Recipient contract mismatch: expected {}, got {}",
+            expected_to, tx.to
+        ));
+    }
+
+    if tx.data != expected_data {
+        return Err("Transaction calldata does not match approved payload".into());
+    }
+
+    // Verify gas policy
+    let total_fee_wei = &tx.gas_price * BigUint::from(tx.gas_limit);
+    let max_fee_wei = BigUint::from(50_000_000_000_000_000u64); // 0.05 BNB cap
+    if total_fee_wei > max_fee_wei {
+        return Err("Estimated fee exceeds safety cap of 0.05 BNB".into());
+    }
+
+    let signed = tx.sign(secp, secret_key)?;
+    let recovered = signed.recover_sender(secp)?;
+
+    if recovered.to_lowercase() != expected_sender.to_lowercase() {
+        return Err(format!(
+            "Recovered sender ({}) does not match authorized owner address ({})",
+            recovered, expected_sender
+        ));
+    }
+
+    Ok(signed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn it04_bsc_rpc_mock_policies_and_pre_sign_validation() {
+        let secp = Secp256k1::new();
+        let test_privkey = SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000001").unwrap();
+        
+        // Derive expected sender
+        let pubkey = test_privkey.public_key(&secp);
+        let uncompressed = pubkey.serialize_uncompressed();
+        let mut hasher = Keccak::v256();
+        let mut hash_res = [0u8; 32];
+        hasher.update(&uncompressed[1..]);
+        hasher.finalize(&mut hash_res);
+        let expected_owner = policy::to_eip55_checksum(&hex::encode(&hash_res[12..32]));
+
+        let contract_to = "0x337610d27c682E347C9cD60bd4b3b107C9d34dDd";
+        let valid_data = hex::decode("a9059cbb0000000000000000000000009858effd232b4033e47d90003d41ec34ecaeda940000000000000000000000000000000000000000000000000de0b6b3a7640000").unwrap();
+
+        let tx = Eip155Transaction {
+            nonce: 0,
+            gas_price: BigUint::from(3_000_000_000u64), // 3 Gwei
+            gas_limit: 65_000,
+            to: contract_to.into(),
+            value: BigUint::from(0u32),
+            data: valid_data.clone(),
+            chain_id: 97,
+        };
+
+        // 1. Valid transaction signing & sender match -> PASS
+        let sign_res = validate_and_sign_bsc_tx(
+            &tx, 97, contract_to, &valid_data, &expected_owner, &secp, &test_privkey
+        );
+        assert!(sign_res.is_ok(), "Valid BSC transaction must pass validation and signing");
+
+        // 2. Chain ID mismatch (e.g. prepared for 56 instead of 97) -> REJECT
+        let mut tx_wrong_chain = tx.clone();
+        tx_wrong_chain.chain_id = 56;
+        let err_chain = validate_and_sign_bsc_tx(
+            &tx_wrong_chain, 97, contract_to, &valid_data, &expected_owner, &secp, &test_privkey
+        );
+        assert!(err_chain.is_err(), "Chain ID mismatch must be rejected");
+
+        // 3. Contract address tampered -> REJECT
+        let mut tx_wrong_contract = tx.clone();
+        tx_wrong_contract.to = "0x1111111111111111111111111111111111111111".into();
+        let err_contract = validate_and_sign_bsc_tx(
+            &tx_wrong_contract, 97, contract_to, &valid_data, &expected_owner, &secp, &test_privkey
+        );
+        assert!(err_contract.is_err(), "Contract address tampering must be rejected");
+
+        // 4. Calldata tampered (amount or recipient modified) -> REJECT
+        let mut tx_wrong_data = tx.clone();
+        tx_wrong_data.data[10] ^= 0x01;
+        let err_data = validate_and_sign_bsc_tx(
+            &tx_wrong_data, 97, contract_to, &valid_data, &expected_owner, &secp, &test_privkey
+        );
+        assert!(err_data.is_err(), "Calldata tampering must be rejected");
+
+        // 5. Total fee exceeding 0.05 BNB cap -> REJECT
+        let mut tx_expensive = tx.clone();
+        tx_expensive.gas_price = BigUint::from(1_000_000_000_000u64); // 1000 Gwei (fee = 0.065 BNB)
+        let err_fee = validate_and_sign_bsc_tx(
+            &tx_expensive, 97, contract_to, &valid_data, &expected_owner, &secp, &test_privkey
+        );
+        assert!(err_fee.is_err(), "Fee exceeding 0.05 BNB cap must be rejected");
+
+        // 6. Signing with unauthorized key (sender mismatch) -> REJECT
+        let wrong_privkey = SecretKey::from_str("0000000000000000000000000000000000000000000000000000000000000002").unwrap();
+        let err_key = validate_and_sign_bsc_tx(
+            &tx, 97, contract_to, &valid_data, &expected_owner, &secp, &wrong_privkey
+        );
+        assert!(err_key.is_err(), "Signing with non-authorized key must be rejected");
+    }
 
     #[test]
     fn official_eip155_test_vector_verification() {
