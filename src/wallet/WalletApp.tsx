@@ -52,11 +52,12 @@ export default function WalletApp() {
     return () => clearInterval(interval);
   }, [cooldown, refresh]);
 
-  // Window visibility / background lock (disabled in DEV mode to allow pair-programming/automation without instant re-lock)
+  // Window visibility / background lock: locked by default on hidden in all environments.
+  // Controlled QA bypass only allowed when explicitly enabled via sessionStorage.
   useEffect(() => {
-    const isDev = Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV);
+    const qaBypass = typeof window !== 'undefined' && window.sessionStorage.getItem('qa_disable_blur_lock') === 'true';
     const handleVisibilityChange = () => {
-      if (document.visibilityState === 'hidden' && status.unlocked && !isDev) {
+      if (document.visibilityState === 'hidden' && status.unlocked && !qaBypass) {
         void invoke('lock_wallet').then(refresh).catch(() => {});
       }
     };

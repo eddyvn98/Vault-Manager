@@ -9,6 +9,9 @@ use vault_manager_lib::wallet::{
 };
 use zeroize::Zeroizing;
 
+const BSC_TESTNET_USDT: &str = "0x337610d27c682E347C9cD60BD4b3b107C9d34dDd";
+const BSC_TESTNET_RPC: &str = "https://data-seed-prebsc-1-s1.binance.org:8545";
+
 fn app_dir() -> PathBuf {
     let home = std::env::var("HOME").expect("HOME environment variable required");
     PathBuf::from(home).join("Library/Application Support/com.eddyvn98.vaultmanager.wallet.experimental")
@@ -37,6 +40,56 @@ fn read_mnemonic(password: &str) -> Result<Zeroizing<String>, String> {
     crypto::decrypt(password, &raw).map_err(|e| format!("Failed to decrypt vault: {}", e))
 }
 
+fn get_password(
+    get_arg: impl Fn(&str) -> Option<String>,
+    has_flag: impl Fn(&str) -> bool,
+) -> Result<String, String> {
+    if has_flag("--password-stdin") {
+        let mut buffer = String::new();
+        std::io::stdin()
+            .read_line(&mut buffer)
+            .map_err(|e| format!("Failed to read password from stdin: {}", e))?;
+        let trimmed = buffer.trim_end_matches(&['\r', '\n'][..]);
+        if trimmed.is_empty() {
+            return Err("Password read from stdin was empty".to_string());
+        }
+        return Ok(trimmed.to_string());
+    }
+
+    if let Ok(env_pw) = std::env::var("VAULT_PASSWORD") {
+        if !env_pw.is_empty() {
+            return Ok(env_pw);
+        }
+    }
+
+    if let Some(cli_pw) = get_arg("--password") {
+        eprintln!(
+            "[SECURITY WARNING] Passing master password via --password CLI argument can leak through process table and shell history. Prefer VAULT_PASSWORD environment variable or --password-stdin."
+        );
+        return Ok(cli_pw);
+    }
+
+    Err(
+        "Master password required. Provide via VAULT_PASSWORD environment variable, --password-stdin, or --password <pw>."
+            .to_string(),
+    )
+}
+
+fn load_coordinator_fail_closed(l_path: &PathBuf) -> Result<TxLifecycleCoordinator, String> {
+    if l_path.exists() {
+        TxLifecycleCoordinator::load_from_file(l_path).map_err(|e| {
+            format!(
+                "FAIL-CLOSED: Persistent coordinator file exists at {:?} but could not be loaded: {}. Halting execution to prevent transaction history loss or corruption.",
+                l_path, e
+            )
+        })
+    } else {
+        let mut c = TxLifecycleCoordinator::new();
+        c.set_storage_path(l_path.clone());
+        Ok(c)
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -44,10 +97,11 @@ async fn main() {
         eprintln!(
             "Usage: agent_cli <subcommand> [options]\n\
              Subcommands:\n  \
-               status [--password <pw>]\n  \
-               btc-balance [--address <addr>]\n  \
-               btc-send --to <addr> --amount <sats> [--fee-rate <rate>] --password <pw> [--broadcast]\n  \
+               status [--password <pw> | --password-stdin]\n  \
+               btc-balance [--address <addr>] [--all]\n  \
+               btc-send --to <addr> --amount <sats> [--fee-rate <rate>] [--broadcast]\n  \
                btc-status --txid <txid>\n  \
+               bsc-balance [--address <addr>]\n  \
                lifecycle-list\n"
         );
         std::process::exit(1);
@@ -73,15 +127,20 @@ async fn main() {
                 "lifecycle_exists": lifecycle_file().exists(),
             });
 
-            if let Some(pw) = get_arg("--password") {
+            if let Ok(pw) = get_password(&get_arg, &has_flag) {
                 match read_mnemonic(&pw) {
                     Ok(mnemonic) => {
                         let signet_0 = bip::derive_btc_address_at(&mnemonic, bitcoin::Network::Signet, 0, 0).unwrap_or_default();
                         let signet_1 = bip::derive_btc_address_at(&mnemonic, bitcoin::Network::Signet, 0, 1).unwrap_or_default();
-                        let bsc_0 = bip::derive_bsc_address(&mnemonic).unwrap_or_default();
+                        let signet_change_0 = bip::derive_btc_address_at(&mnemonic, bitcoin::Network::Signet, 1, 0).unwrap_or_default();
+                        let bsc_0 = bip::derive_bsc_address_at(&mnemonic, 0).unwrap_or_default();
+                        let bsc_1 = bip::derive_bsc_address_at(&mnemonic, 1).unwrap_or_default();
+
                         out["signet_receive_0"] = serde_json::json!(signet_0);
                         out["signet_receive_1"] = serde_json::json!(signet_1);
+                        out["signet_change_0"] = serde_json::json!(signet_change_0);
                         out["bsc_address_0"] = serde_json::json!(bsc_0);
+                        out["bsc_address_1"] = serde_json::json!(bsc_1);
                         out["unlocked"] = serde_json::json!(true);
                     }
                     Err(e) => {
@@ -94,10 +153,19 @@ async fn main() {
         }
 
         "btc-balance" => {
-            let addr = if let Some(a) = get_arg("--address") {
-                a
-            } else {
-                let pw = get_arg("--password").unwrap_or_else(|| "TestnetWalletPass123!@#".to_string());
+            let client = reqwest::Client::new();
+            let esplora_url = "https://mempool.space/signet/api";
+
+            let addresses = if let Some(a) = get_arg("--address") {
+                vec![a]
+            } else if has_flag("--all") {
+                let pw = match get_password(&get_arg, &has_flag) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("{}", serde_json::json!({"error": e}));
+                        std::process::exit(1);
+                    }
+                };
                 let mnemonic = match read_mnemonic(&pw) {
                     Ok(m) => m,
                     Err(e) => {
@@ -105,42 +173,86 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-                bip::derive_btc_address_at(&mnemonic, bitcoin::Network::Signet, 0, 0).unwrap()
+                vec![
+                    bip::derive_btc_address_at(&mnemonic, bitcoin::Network::Signet, 0, 0).unwrap(),
+                    bip::derive_btc_address_at(&mnemonic, bitcoin::Network::Signet, 0, 1).unwrap(),
+                    bip::derive_btc_address_at(&mnemonic, bitcoin::Network::Signet, 1, 0).unwrap(),
+                ]
+            } else {
+                let pw = match get_password(&get_arg, &has_flag) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("{}", serde_json::json!({"error": e}));
+                        std::process::exit(1);
+                    }
+                };
+                let mnemonic = match read_mnemonic(&pw) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("{}", serde_json::json!({"error": e}));
+                        std::process::exit(1);
+                    }
+                };
+                vec![bip::derive_btc_address_at(&mnemonic, bitcoin::Network::Signet, 0, 0).unwrap()]
             };
 
-            let esplora_url = "https://mempool.space/signet/api";
-            let client = reqwest::Client::new();
-            let resp = client.get(format!("{}/address/{}", esplora_url, addr)).send().await;
-            match resp {
-                Ok(r) => {
-                    let json: serde_json::Value = r.json().await.unwrap_or_default();
-                    let utxos: serde_json::Value = match client.get(format!("{}/address/{}/utxo", esplora_url, addr)).send().await {
-                        Ok(u) => u.json().await.unwrap_or_default(),
-                        Err(_) => serde_json::Value::Array(vec![]),
-                    };
+            let mut results = Vec::new();
+            let mut grand_confirmed: i64 = 0;
+            let mut grand_mempool: i64 = 0;
+            let mut grand_utxos: usize = 0;
 
-                    let chain_funded = json["chain_stats"]["funded_txo_sum"].as_i64().unwrap_or(0);
-                    let chain_spent = json["chain_stats"]["spent_txo_sum"].as_i64().unwrap_or(0);
-                    let confirmed_sats = chain_funded - chain_spent;
+            for addr in addresses {
+                let resp = client.get(format!("{}/address/{}", esplora_url, addr)).send().await;
+                match resp {
+                    Ok(r) => {
+                        let json: serde_json::Value = r.json().await.unwrap_or_default();
+                        let utxos: serde_json::Value = match client.get(format!("{}/address/{}/utxo", esplora_url, addr)).send().await {
+                            Ok(u) => u.json().await.unwrap_or_default(),
+                            Err(_) => serde_json::Value::Array(vec![]),
+                        };
 
-                    let mempool_funded = json["mempool_stats"]["funded_txo_sum"].as_i64().unwrap_or(0);
-                    let mempool_spent = json["mempool_stats"]["spent_txo_sum"].as_i64().unwrap_or(0);
-                    let mempool_delta_sats = mempool_funded - mempool_spent;
+                        let chain_funded = json["chain_stats"]["funded_txo_sum"].as_i64().unwrap_or(0);
+                        let chain_spent = json["chain_stats"]["spent_txo_sum"].as_i64().unwrap_or(0);
+                        let confirmed_sats = chain_funded - chain_spent;
 
-                    let out = serde_json::json!({
-                        "address": addr,
-                        "confirmed_sats": confirmed_sats,
-                        "mempool_delta_sats": mempool_delta_sats,
-                        "total_sats": confirmed_sats + mempool_delta_sats,
-                        "utxo_count": utxos.as_array().map(|a| a.len()).unwrap_or(0),
-                        "utxos": utxos,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                        let mempool_funded = json["mempool_stats"]["funded_txo_sum"].as_i64().unwrap_or(0);
+                        let mempool_spent = json["mempool_stats"]["spent_txo_sum"].as_i64().unwrap_or(0);
+                        let mempool_delta_sats = mempool_funded - mempool_spent;
+
+                        let count = utxos.as_array().map(|a| a.len()).unwrap_or(0);
+                        grand_confirmed += confirmed_sats;
+                        grand_mempool += mempool_delta_sats;
+                        grand_utxos += count;
+
+                        results.push(serde_json::json!({
+                            "address": addr,
+                            "confirmed_sats": confirmed_sats,
+                            "mempool_delta_sats": mempool_delta_sats,
+                            "total_sats": confirmed_sats + mempool_delta_sats,
+                            "utxo_count": count,
+                            "utxos": utxos,
+                        }));
+                    }
+                    Err(e) => {
+                        eprintln!("{}", serde_json::json!({"error": format!("Network request failed: {}", e)}));
+                        std::process::exit(1);
+                    }
                 }
-                Err(e) => {
-                    eprintln!("{}", serde_json::json!({"error": format!("Network request failed: {}", e)}));
-                    std::process::exit(1);
-                }
+            }
+
+            if results.len() == 1 {
+                println!("{}", serde_json::to_string_pretty(&results[0]).unwrap());
+            } else {
+                let summary = serde_json::json!({
+                    "addresses": results,
+                    "grand_total": {
+                        "confirmed_sats": grand_confirmed,
+                        "mempool_delta_sats": grand_mempool,
+                        "total_sats": grand_confirmed + grand_mempool,
+                        "total_utxo_count": grand_utxos,
+                    }
+                });
+                println!("{}", serde_json::to_string_pretty(&summary).unwrap());
             }
         }
 
@@ -150,8 +262,15 @@ async fn main() {
             let amount_sats: u64 = amount_str.parse().expect("amount must be an integer");
             let fee_rate_str = get_arg("--fee-rate").unwrap_or_else(|| "2".to_string());
             let fee_rate: u64 = fee_rate_str.parse().expect("fee-rate must be an integer");
-            let pw = get_arg("--password").expect("--password <pw> is required");
             let should_broadcast = has_flag("--broadcast");
+
+            let pw = match get_password(&get_arg, &has_flag) {
+                Ok(p) => p,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": e}));
+                    std::process::exit(1);
+                }
+            };
 
             // 1. Decrypt mnemonic
             let mnemonic = match read_mnemonic(&pw) {
@@ -235,22 +354,22 @@ async fn main() {
                 std::process::exit(1);
             }
 
-            // 6. Record into TxLifecycleCoordinator
+            // 6. Fail-closed record into TxLifecycleCoordinator
             let l_path = lifecycle_file();
-            let mut coord = if l_path.exists() {
-                TxLifecycleCoordinator::load_from_file(&l_path).unwrap_or_else(|_| {
-                    let mut c = TxLifecycleCoordinator::new();
-                    c.set_storage_path(l_path.clone());
-                    c
-                })
-            } else {
-                let mut c = TxLifecycleCoordinator::new();
-                c.set_storage_path(l_path.clone());
-                c
+            let mut coord = match load_coordinator_fail_closed(&l_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": e}));
+                    std::process::exit(1);
+                }
             };
 
-            let _ = coord.register_draft(&preview.draft_id, broadcast::types::BroadcastNetwork::BitcoinSignet, now_unix);
-            let _ = coord.record_signed_btc(
+            if let Err(e) = coord.register_draft(&preview.draft_id, broadcast::types::BroadcastNetwork::BitcoinSignet, now_unix) {
+                eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: coordinator.register_draft failed: {}", e)}));
+                std::process::exit(1);
+            }
+
+            if let Err(e) = coord.record_signed_btc(
                 &preview.draft_id,
                 &signed.payload_hash,
                 &signed.raw_tx_hex,
@@ -258,7 +377,10 @@ async fn main() {
                 &signed.wtxid,
                 approved_prevouts.clone(),
                 now_unix,
-            );
+            ) {
+                eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: coordinator.record_signed_btc failed: {}", e)}));
+                std::process::exit(1);
+            }
 
             let mut out = serde_json::json!({
                 "action": "btc-send",
@@ -327,18 +449,24 @@ async fn main() {
                         out["broadcasted"] = serde_json::json!(true);
                         out["broadcast_txid"] = serde_json::json!(txid);
                         out["explorer_url"] = serde_json::json!(format!("https://mempool.space/signet/tx/{}", txid));
+                        println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                        std::process::exit(0);
                     }
                     broadcast::lifecycle::BroadcastOutcome::Failed(err) => {
                         out["status"] = serde_json::json!("broadcast_failed");
                         out["broadcast_error"] = serde_json::json!(err);
+                        eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
+                        std::process::exit(1);
                     }
                     broadcast::lifecycle::BroadcastOutcome::Retry => {
                         out["status"] = serde_json::json!("broadcast_retry_needed");
+                        eprintln!("{}", serde_json::to_string_pretty(&out).unwrap());
+                        std::process::exit(2);
                     }
                 }
+            } else {
+                println!("{}", serde_json::to_string_pretty(&out).unwrap());
             }
-
-            println!("{}", serde_json::to_string_pretty(&out).unwrap());
         }
 
         "btc-status" => {
@@ -363,6 +491,170 @@ async fn main() {
             }
         }
 
+        "bsc-balance" => {
+            let addr = if let Some(a) = get_arg("--address") {
+                a
+            } else {
+                let pw = match get_password(&get_arg, &has_flag) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("{}", serde_json::json!({"error": e}));
+                        std::process::exit(1);
+                    }
+                };
+                let mnemonic = match read_mnemonic(&pw) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("{}", serde_json::json!({"error": e}));
+                        std::process::exit(1);
+                    }
+                };
+                bip::derive_bsc_address_at(&mnemonic, 0).unwrap()
+            };
+
+            let client = reqwest::Client::new();
+
+            // 1. eth_chainId
+            let chain_id_payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_chainId",
+                "params": [],
+                "id": 1
+            });
+            let chain_id_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
+                .json(&chain_id_payload)
+                .send()
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap()
+                .json()
+                .await
+                .unwrap_or_default();
+            let chain_id_hex = chain_id_resp["result"].as_str().unwrap_or("0x0");
+            let chain_id = u64::from_str_radix(chain_id_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+
+            // 2. eth_getBalance (tBNB)
+            let balance_payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_getBalance",
+                "params": [&addr, "latest"],
+                "id": 2
+            });
+            let balance_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
+                .json(&balance_payload)
+                .send()
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap()
+                .json()
+                .await
+                .unwrap_or_default();
+            let tbnb_wei_hex = balance_resp["result"].as_str().unwrap_or("0x0");
+            let tbnb_wei = u128::from_str_radix(tbnb_wei_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+            let tbnb_decimal = (tbnb_wei as f64) / 1e18;
+
+            // 3. eth_getTransactionCount (nonce)
+            let nonce_payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_getTransactionCount",
+                "params": [&addr, "latest"],
+                "id": 3
+            });
+            let nonce_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
+                .json(&nonce_payload)
+                .send()
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap()
+                .json()
+                .await
+                .unwrap_or_default();
+            let nonce_hex = nonce_resp["result"].as_str().unwrap_or("0x0");
+            let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+
+            // 4. eth_getCode (USDT contract bytecode check)
+            let code_payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_getCode",
+                "params": [BSC_TESTNET_USDT, "latest"],
+                "id": 4
+            });
+            let code_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
+                .json(&code_payload)
+                .send()
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap()
+                .json()
+                .await
+                .unwrap_or_default();
+            let code_hex = code_resp["result"].as_str().unwrap_or("0x");
+            let contract_exists = code_hex.len() > 10;
+
+            // 5. decimals() of USDT: 0x313ce567
+            let decimals_payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{
+                    "to": BSC_TESTNET_USDT,
+                    "data": "0x313ce567"
+                }, "latest"],
+                "id": 5
+            });
+            let decimals_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
+                .json(&decimals_payload)
+                .send()
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap()
+                .json()
+                .await
+                .unwrap_or_default();
+            let decimals_hex = decimals_resp["result"].as_str().unwrap_or("0x12");
+            let decimals = u32::from_str_radix(decimals_hex.trim_start_matches("0x"), 16).unwrap_or(18);
+
+            // 6. balanceOf(address) of USDT: 0x70a08231 + 32-byte padded address
+            let clean_addr = addr.trim_start_matches("0x");
+            let call_data = format!("0x70a08231000000000000000000000000{}", clean_addr);
+            let token_payload = serde_json::json!({
+                "jsonrpc": "2.0",
+                "method": "eth_call",
+                "params": [{
+                    "to": BSC_TESTNET_USDT,
+                    "data": call_data
+                }, "latest"],
+                "id": 6
+            });
+            let token_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
+                .json(&token_payload)
+                .send()
+                .await
+                .map_err(|e| e.to_string())
+                .unwrap()
+                .json()
+                .await
+                .unwrap_or_default();
+            let usdt_units_hex = token_resp["result"].as_str().unwrap_or("0x0");
+            let usdt_units = u128::from_str_radix(usdt_units_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+            let usdt_decimal = (usdt_units as f64) / 10f64.powi(decimals as i32);
+
+            let out = serde_json::json!({
+                "address": addr,
+                "chain_id": chain_id,
+                "chain_id_hex": chain_id_hex,
+                "nonce": nonce,
+                "tbnb_wei": tbnb_wei.to_string(),
+                "tbnb_balance": format!("{:.6} tBNB", tbnb_decimal),
+                "usdt_contract": BSC_TESTNET_USDT,
+                "usdt_contract_exists": contract_exists,
+                "usdt_decimals": decimals,
+                "usdt_raw_units": usdt_units.to_string(),
+                "usdt_balance": format!("{:.6} USDT", usdt_decimal),
+                "explorer_url": format!("https://testnet.bscscan.com/address/{}", addr),
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
+        }
+
         "lifecycle-list" => {
             let l_path = lifecycle_file();
             if !l_path.exists() {
@@ -375,7 +667,7 @@ async fn main() {
                     println!("{}", serde_json::to_string_pretty(&records).unwrap());
                 }
                 Err(e) => {
-                    eprintln!("{}", serde_json::json!({"error": format!("Failed to read lifecycle file: {}", e)}));
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: Failed to read lifecycle file: {}", e)}));
                     std::process::exit(1);
                 }
             }
