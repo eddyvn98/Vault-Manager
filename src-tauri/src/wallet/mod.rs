@@ -88,45 +88,28 @@ pub fn compute_btc_payload_hash(unsigned_psbt_base64: &str) -> String {
     format!("0x{}", hex::encode(hash))
 }
 
-pub fn compute_bsc_payload_hash(
-    chain_id: u64,
-    token_contract: Option<&str>,
-    recipient_address: &str,
-    amount_raw: &str,
-    nonce: u64,
-    gas_limit: u64,
-    gas_price_wei: &str,
-) -> String {
-    let canonical = format!(
-        "bsc:{}:{}:{}:{}:{}:{}:{}",
-        chain_id,
-        token_contract.unwrap_or(""),
-        recipient_address,
-        amount_raw,
-        nonce,
-        gas_limit,
-        gas_price_wei
-    );
-    let mut hasher = Keccak::v256();
-    let mut hash = [0u8; 32];
-    hasher.update(canonical.as_bytes());
-    hasher.finalize(&mut hash);
-    format!("0x{}", hex::encode(hash))
-}
-
-/// Binds draft verification directly to BTC signing: Impossible to sign without
-/// verifying and consuming an active draft in the current session epoch with an unlocked wallet.
+/// Binds draft verification directly to BTC signing:
+/// Decodes the PSBT directly from the approved unsigned_psbt_base64 string,
+/// validates against approved policy, derives each input's key using approved.change and derivation_index,
+/// finalizes the PSBT, extracts the raw signed transaction, and returns (fee_sat, raw_tx_hex).
 #[allow(dead_code)]
 pub fn sign_verified_btc_draft(
     session: &mut SessionState,
     draft_id: &str,
     unsigned_psbt_base64: &str,
-    psbt: &mut bitcoin::Psbt,
     policy: &signer::btc::BtcSigningPolicy,
-    derivation_indices: &[u32],
-) -> Result<u64, String> {
+) -> Result<(u64, String), String> {
+    use base64::Engine;
+
     let payload_hash = compute_btc_payload_hash(unsigned_psbt_base64);
     session.verify_and_consume_draft(draft_id, &payload_hash)?;
+
+    // Decode PSBT directly from the approved unsigned_psbt_base64 string
+    let psbt_bytes = base64::engine::general_purpose::STANDARD
+        .decode(unsigned_psbt_base64.trim())
+        .map_err(|e| format!("Invalid base64 in approved PSBT: {}", e))?;
+    let mut psbt = bitcoin::Psbt::deserialize(&psbt_bytes)
+        .map_err(|e| format!("Invalid PSBT encoding: {}", e))?;
 
     let mnemonic_str = session
         .mnemonic
@@ -134,34 +117,38 @@ pub fn sign_verified_btc_draft(
         .ok_or_else(|| "Wallet is locked: private key unavailable".to_string())?;
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
-    let mut privkeys = Vec::with_capacity(derivation_indices.len());
-    for &idx in derivation_indices {
-        let key = bip::derive_bip84_privkey_at(mnemonic_str, bitcoin::Network::Signet, 0, idx)?;
+    let mut privkeys = Vec::with_capacity(policy.approved_inputs.len());
+    for approved in &policy.approved_inputs {
+        let key = bip::derive_bip84_privkey_at(
+            mnemonic_str,
+            bitcoin::Network::Signet,
+            approved.change,
+            approved.derivation_index,
+        )?;
         privkeys.push(key);
     }
 
-    let fee = signer::btc::sign_and_finalize_verified_psbt_multi(psbt, policy, &secp, &privkeys)?;
-    Ok(fee)
+    let fee = signer::btc::sign_and_finalize_verified_psbt_multi(&mut psbt, policy, &secp, &privkeys)?;
+
+    let extracted_tx = psbt.extract_tx()
+        .map_err(|e| format!("Cannot extract final signed transaction from PSBT: {:?}", e))?;
+    let raw_tx_bytes = bitcoin::consensus::serialize(&extracted_tx);
+    let raw_tx_hex = hex::encode(raw_tx_bytes);
+
+    Ok((fee, raw_tx_hex))
 }
 
-/// Binds draft verification directly to BSC signing: Impossible to sign without
-/// verifying and consuming an active draft in the current session epoch with an unlocked wallet.
+/// Binds draft verification directly to BSC signing:
+/// Verifies and consumes draft using canonical_payload.canonical_hash(),
+/// builds BscSigningPolicy and Eip155Transaction directly from canonical_payload,
+/// derives EVM key, signs transaction, and recovers sender.
 #[allow(dead_code)]
 pub fn sign_verified_bsc_draft(
     session: &mut SessionState,
     draft_id: &str,
-    tx: &signer::bsc::Eip155Transaction,
-    policy: &signer::bsc::BscSigningPolicy,
+    canonical_payload: &tx::BscCanonicalPayload,
 ) -> Result<signer::bsc::Eip155SignedTransaction, String> {
-    let payload_hash = compute_bsc_payload_hash(
-        policy.expected_chain_id,
-        Some(&policy.expected_to),
-        &policy.expected_to,
-        &hex::encode(&policy.expected_data),
-        policy.expected_nonce,
-        policy.expected_gas_limit,
-        &policy.expected_gas_price.to_string(),
-    );
+    let payload_hash = canonical_payload.canonical_hash();
     session.verify_and_consume_draft(draft_id, &payload_hash)?;
 
     let mnemonic_str = session
@@ -171,19 +158,34 @@ pub fn sign_verified_bsc_draft(
 
     let secp = secp256k1::Secp256k1::new();
     let privkey = bip::derive_bsc_privkey_at(mnemonic_str, 0)?;
+    let sender_addr = bip::derive_bsc_address_at(mnemonic_str, 0)?;
 
-    let signed = signer::bsc::validate_and_sign_bsc_tx(tx, policy, &secp, &privkey)?;
+    let policy = signer::bsc::BscSigningPolicy::from_canonical_payload(canonical_payload, &sender_addr)?;
+
+    let tx = signer::bsc::Eip155Transaction {
+        nonce: canonical_payload.nonce,
+        gas_price: policy.expected_gas_price.clone(),
+        gas_limit: canonical_payload.gas_limit,
+        to: policy.expected_to.clone(),
+        value: num_bigint::BigUint::from(0u32),
+        data: policy.expected_data.clone(),
+        chain_id: canonical_payload.chain_id,
+    };
+
+    let signed = signer::bsc::validate_and_sign_bsc_tx(&tx, &policy, &secp, &privkey)?;
     Ok(signed)
 }
 
 pub struct WalletSession {
     pub session: Mutex<SessionState>,
+    pub is_preparing: std::sync::atomic::AtomicBool,
 }
 
 impl Default for WalletSession {
     fn default() -> Self {
         Self {
             session: Mutex::new(SessionState::default()),
+            is_preparing: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -509,6 +511,17 @@ pub async fn prepare_btc_transaction(
     amount_satoshis: u64,
     fee_rate_sat_vb: Option<u64>,
 ) -> Result<tx::BtcTxPreview, String> {
+    if state.is_preparing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("A transaction preparation or wallet reset is already in progress".into());
+    }
+    struct PrepareGuard<'a>(&'a std::sync::atomic::AtomicBool);
+    impl<'a> Drop for PrepareGuard<'a> {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _guard = PrepareGuard(&state.is_preparing);
+
     let (mnemonic, initial_epoch) = {
         let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
         if !check_and_apply_auto_lock(&mut session) {
@@ -541,11 +554,7 @@ pub async fn prepare_btc_transaction(
         return Err("Wallet was locked, reset, or session expired during transaction preparation. Stale draft discarded.".into());
     }
 
-    let mut hasher = Keccak::v256();
-    let mut hash = [0u8; 32];
-    hasher.update(preview.unsigned_psbt_base64.as_bytes());
-    hasher.finalize(&mut hash);
-    let payload_hash = format!("0x{}", hex::encode(hash));
+    let payload_hash = compute_btc_payload_hash(&preview.unsigned_psbt_base64);
 
     let expires_at_unix = LockoutManager::now_unix() + SESSION_TIMEOUT_SECS;
 
@@ -567,6 +576,17 @@ pub async fn prepare_bsc_transaction(
     recipient: String,
     amount_tokens: String,
 ) -> Result<tx::BscTxPreview, String> {
+    if state.is_preparing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("A transaction preparation or wallet reset is already in progress".into());
+    }
+    struct PrepareGuard<'a>(&'a std::sync::atomic::AtomicBool);
+    impl<'a> Drop for PrepareGuard<'a> {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _guard = PrepareGuard(&state.is_preparing);
+
     let (mnemonic, initial_epoch) = {
         let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
         if !check_and_apply_auto_lock(&mut session) {
@@ -592,21 +612,17 @@ pub async fn prepare_bsc_transaction(
     }
 
     // Canonical representation covering all critical transaction parameters
-    let canonical = format!(
-        "bsc:{}:{}:{}:{}:{}:{}:{}",
-        preview.chain_id,
-        preview.token_contract.as_deref().unwrap_or("none").to_lowercase(),
-        preview.recipient_address.to_lowercase(),
-        preview.amount_raw,
-        preview.nonce,
-        preview.gas_limit,
-        preview.gas_price_wei
-    );
-    let mut hasher = Keccak::v256();
-    let mut hash = [0u8; 32];
-    hasher.update(canonical.as_bytes());
-    hasher.finalize(&mut hash);
-    let payload_hash = format!("0x{}", hex::encode(hash));
+    let canonical_payload = tx::BscCanonicalPayload {
+        chain_id: preview.chain_id,
+        token_contract: preview.token_contract.clone(),
+        recipient_address: preview.recipient_address.clone(),
+        amount_raw: preview.amount_raw.clone(),
+        nonce: preview.nonce,
+        gas_limit: preview.gas_limit,
+        gas_price_wei: preview.gas_price_wei.clone(),
+        calldata_hex: preview.calldata_hex.clone(),
+    };
+    let payload_hash = canonical_payload.canonical_hash();
 
     let expires_at_unix = LockoutManager::now_unix() + SESSION_TIMEOUT_SECS;
 
@@ -646,6 +662,17 @@ pub fn reset_wallet(
     state: State<'_, WalletSession>,
     password: String,
 ) -> Result<(), String> {
+    if state.is_preparing.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return Err("Cannot reset wallet while a transaction preparation is in progress".into());
+    }
+    struct ResetGuard<'a>(&'a std::sync::atomic::AtomicBool);
+    impl<'a> Drop for ResetGuard<'a> {
+        fn drop(&mut self) {
+            self.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+    let _guard = ResetGuard(&state.is_preparing);
+
     let mgr = lockout_manager(&app)?;
     mgr.check_lockout()?;
 
@@ -943,5 +970,188 @@ mod tests {
         assert!(!shm_file.exists(), "SHM file must be removed");
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_e2e_btc_prepare_draft_sign_and_raw_tx_verification() {
+        use bitcoin::{
+            amount::Amount, hashes::Hash, locktime::absolute::LockTime, transaction::Version,
+            OutPoint, Psbt, ScriptBuf, Sequence, Transaction, TxIn, TxOut, Witness,
+        };
+        use std::str::FromStr;
+
+        let mnemonic = bip::generate_24_words().unwrap();
+        let mut session = SessionState::default();
+        session.session_epoch = 1;
+        session.mnemonic = Some(mnemonic.clone());
+
+        // Derive receive key at m/84'/1'/0'/0/0 and change key at m/84'/1'/0'/1/0
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let key_recv = bip::derive_bip84_privkey_at(&mnemonic, bitcoin::Network::Signet, 0, 0).unwrap();
+        let pub_recv = key_recv.public_key(&secp);
+        let btc_pub_recv = bitcoin::PublicKey::from_slice(&pub_recv.serialize()).unwrap();
+        let script_recv = ScriptBuf::new_p2wpkh(&btc_pub_recv.wpubkey_hash().unwrap());
+
+        let key_change = bip::derive_bip84_privkey_at(&mnemonic, bitcoin::Network::Signet, 1, 0).unwrap();
+        let pub_change = key_change.public_key(&secp);
+        let btc_pub_change = bitcoin::PublicKey::from_slice(&pub_change.serialize()).unwrap();
+        let script_change = ScriptBuf::new_p2wpkh(&btc_pub_change.wpubkey_hash().unwrap());
+
+        // Construct 2-input PSBT (input 0: receive, input 1: change)
+        let outpoint0 = OutPoint::from_str("1111111111111111111111111111111111111111111111111111111111111111:0").unwrap();
+        let outpoint1 = OutPoint::from_str("2222222222222222222222222222222222222222222222222222222222222222:1").unwrap();
+
+        let tx_in0 = TxIn {
+            previous_output: outpoint0,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        };
+        let tx_in1 = TxIn {
+            previous_output: outpoint1,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        };
+
+        let recipient_script = ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::all_zeros());
+        let tx_out_send = TxOut {
+            value: Amount::from_sat(60_000),
+            script_pubkey: recipient_script.clone(),
+        };
+        let tx_out_change = TxOut {
+            value: Amount::from_sat(17_000),
+            script_pubkey: script_change.clone(),
+        };
+
+        let unsigned_tx = Transaction {
+            version: Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![tx_in0, tx_in1],
+            output: vec![tx_out_send, tx_out_change],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(50_000),
+            script_pubkey: script_recv.clone(),
+        });
+        psbt.inputs[1].witness_utxo = Some(TxOut {
+            value: Amount::from_sat(30_000),
+            script_pubkey: script_change.clone(),
+        });
+
+        use base64::Engine;
+        let unsigned_psbt_base64 = base64::engine::general_purpose::STANDARD.encode(psbt.serialize());
+        let payload_hash = compute_btc_payload_hash(&unsigned_psbt_base64);
+
+        let draft_id = "draft-btc-e2e-001";
+        session.active_draft = Some(ActiveDraft {
+            draft_id: draft_id.into(),
+            session_epoch: 1,
+            network: "Bitcoin Signet".into(),
+            payload_hash: payload_hash.clone(),
+            expires_at_unix: LockoutManager::now_unix() + 300,
+        });
+
+        let policy = signer::btc::BtcSigningPolicy {
+            expected_recipient: recipient_script,
+            expected_amount_sat: 60_000,
+            expected_change_script: Some(script_change.clone()),
+            approved_inputs: vec![
+                signer::btc::ApprovedPrevout {
+                    outpoint: outpoint0,
+                    value_satoshis: 50_000,
+                    script_pubkey: script_recv,
+                    change: 0,
+                    derivation_index: 0,
+                },
+                signer::btc::ApprovedPrevout {
+                    outpoint: outpoint1,
+                    value_satoshis: 30_000,
+                    script_pubkey: script_change,
+                    change: 1,
+                    derivation_index: 0,
+                },
+            ],
+        };
+
+        // Execute unified draft-bound signing
+        let (fee, raw_tx_hex) = sign_verified_btc_draft(
+            &mut session,
+            draft_id,
+            &unsigned_psbt_base64,
+            &policy,
+        ).expect("End-to-end BTC signing must succeed");
+
+        assert_eq!(fee, 3000, "Fee must be 50k + 30k - 60k - 17k = 3000 sats");
+        assert!(session.active_draft.is_none(), "Active draft must be consumed");
+
+        // Verify raw transaction decodes and has valid witnesses on both inputs
+        let raw_bytes = hex::decode(&raw_tx_hex).expect("Raw tx must be valid hex");
+        let final_tx: Transaction = bitcoin::consensus::deserialize(&raw_bytes).expect("Raw tx must deserialize");
+        assert_eq!(final_tx.input.len(), 2);
+        assert!(!final_tx.input[0].witness.is_empty(), "Input 0 witness must be present");
+        assert!(!final_tx.input[1].witness.is_empty(), "Input 1 witness must be present");
+    }
+
+    #[test]
+    fn test_e2e_bsc_prepare_draft_sign_and_raw_tx_verification() {
+        let mnemonic = bip::generate_24_words().unwrap();
+        let mut session = SessionState::default();
+        session.session_epoch = 1;
+        session.mnemonic = Some(mnemonic.clone());
+
+        let contract_to = "0x337610d27c682E347C9cD60bd4b3b107C9d34dDd";
+        let recipient_addr = "0x9858EfFD232B4033E47d90003D41EC34EcaEda94";
+        let calldata_hex = format!("0x{}", hex::encode(tx::bsc::calldata::encode_erc20_transfer(
+            recipient_addr,
+            &num_bigint::BigUint::from(1_000_000_000_000_000_000u64),
+        ).unwrap()));
+
+        let canonical_payload = tx::BscCanonicalPayload {
+            chain_id: 97,
+            token_contract: Some(contract_to.to_string()),
+            recipient_address: recipient_addr.to_string(),
+            amount_raw: "1000000000000000000".to_string(),
+            nonce: 7,
+            gas_limit: 65_000,
+            gas_price_wei: "3000000000".to_string(),
+            calldata_hex,
+        };
+
+        let draft_id = "draft-bsc-e2e-001";
+        let payload_hash = canonical_payload.canonical_hash();
+
+        session.active_draft = Some(ActiveDraft {
+            draft_id: draft_id.into(),
+            session_epoch: 1,
+            network: "BSC Testnet".into(),
+            payload_hash,
+            expires_at_unix: LockoutManager::now_unix() + 300,
+        });
+
+        // Execute unified draft-bound signing
+        let signed = sign_verified_bsc_draft(
+            &mut session,
+            draft_id,
+            &canonical_payload,
+        ).expect("End-to-end BSC signing must succeed");
+
+        assert!(session.active_draft.is_none(), "Active draft must be consumed");
+        assert_eq!(signed.tx.value, num_bigint::BigUint::from(0u32), "Value must be strictly 0");
+        assert_eq!(signed.tx.nonce, 7);
+        assert_eq!(signed.tx.gas_limit, 65_000);
+
+        // Verify sender matches derived address
+        let expected_sender = bip::derive_bsc_address(&mnemonic).unwrap();
+        let secp = secp256k1::Secp256k1::new();
+        let recovered = signed.recover_sender(&secp).unwrap();
+        assert_eq!(recovered.to_lowercase(), expected_sender.to_lowercase());
+
+        // Verify raw signed transaction is non-empty valid RLP hex
+        assert!(!signed.raw_signed_tx_bytes.is_empty());
+        let raw_hex = hex::encode(&signed.raw_signed_tx_bytes);
+        assert!(raw_hex.starts_with("f8")); // Standard RLP list prefix
     }
 }

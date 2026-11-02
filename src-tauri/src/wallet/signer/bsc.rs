@@ -232,6 +232,36 @@ pub struct BscSigningPolicy {
     pub expected_gas_price: BigUint,
 }
 
+impl BscSigningPolicy {
+    pub fn from_canonical_payload(
+        payload: &crate::wallet::tx::BscCanonicalPayload,
+        expected_sender: &str,
+    ) -> Result<Self, String> {
+        let contract = payload
+            .token_contract
+            .as_ref()
+            .ok_or_else(|| "Missing token contract address in canonical payload".to_string())?;
+
+        let clean_hex = payload.calldata_hex.trim().trim_start_matches("0x");
+        let data = hex::decode(clean_hex)
+            .map_err(|e| format!("Invalid hex calldata in canonical payload: {}", e))?;
+
+        let gas_price = BigUint::parse_bytes(payload.gas_price_wei.as_bytes(), 10)
+            .ok_or_else(|| "Invalid gas price wei in canonical payload".to_string())?;
+
+        Ok(Self {
+            expected_chain_id: payload.chain_id,
+            expected_to: contract.clone(),
+            expected_data: data,
+            expected_sender: expected_sender.to_string(),
+            expected_value: BigUint::from(0u32),
+            expected_nonce: payload.nonce,
+            expected_gas_limit: payload.gas_limit,
+            expected_gas_price: gas_price,
+        })
+    }
+}
+
 /// Validate transaction against approved policy, contract, calldata, gas fields, nonce, value,
 /// and authorized sender address before signing.
 pub fn validate_and_sign_bsc_tx(

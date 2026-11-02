@@ -4,4 +4,4 @@ pub mod btc;
 pub mod bsc;
 
 #[allow(unused_imports)]
-pub use types::{BtcTxPreview, BscTxPreview, PrepareBtcParams, PrepareBscParams};
+pub use types::{BtcTxPreview, BscTxPreview, BscCanonicalPayload, PrepareBtcParams, PrepareBscParams};

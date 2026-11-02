@@ -135,8 +135,11 @@ impl TxLifecycleStatus {
             (TxLifecycleStatus::Confirmed { tx_hash: h1, .. }, TxLifecycleStatus::ReorgDetected { tx_hash: h2, .. }) => {
                 h1 == h2
             }
-            // ReorgDetected -> Pending (tx back in mempool) or Dropped
+            // ReorgDetected -> Pending (tx back in mempool), Confirmed (re-mined), or Dropped
             (TxLifecycleStatus::ReorgDetected { tx_hash: h1, .. }, TxLifecycleStatus::Pending { tx_hash: h2, .. }) => {
+                h1 == h2
+            }
+            (TxLifecycleStatus::ReorgDetected { tx_hash: h1, .. }, TxLifecycleStatus::Confirmed { tx_hash: h2, .. }) => {
                 h1 == h2
             }
             (TxLifecycleStatus::ReorgDetected { tx_hash: h1, .. }, TxLifecycleStatus::Dropped { tx_hash: h2, .. }) => {

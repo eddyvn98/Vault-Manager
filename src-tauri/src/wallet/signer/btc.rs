@@ -13,6 +13,7 @@ pub struct ApprovedPrevout {
     pub outpoint: OutPoint,
     pub value_satoshis: u64,
     pub script_pubkey: ScriptBuf,
+    pub change: u32, // 0 for receive branch, 1 for change branch
     pub derivation_index: u32,
 }
 
@@ -387,6 +388,7 @@ mod tests {
                 outpoint: prevout_point,
                 value_satoshis: 50_000,
                 script_pubkey: wallet_script,
+                change: 0,
                 derivation_index: 0,
             }],
         };
@@ -559,12 +561,14 @@ mod tests {
                     outpoint: outpoint0,
                     value_satoshis: 50_000,
                     script_pubkey: script0.clone(),
+                    change: 0,
                     derivation_index: 0,
                 },
                 ApprovedPrevout {
                     outpoint: outpoint1,
                     value_satoshis: 30_000,
                     script_pubkey: script1.clone(),
+                    change: 1, // Change keychain branch
                     derivation_index: 1,
                 },
             ],

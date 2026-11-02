@@ -28,6 +28,39 @@ pub struct BtcTxPreview {
     pub note: String,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct BscCanonicalPayload {
+    pub chain_id: u64,
+    pub token_contract: Option<String>,
+    pub recipient_address: String,
+    pub amount_raw: String,
+    pub nonce: u64,
+    pub gas_limit: u64,
+    pub gas_price_wei: String,
+    pub calldata_hex: String,
+}
+
+impl BscCanonicalPayload {
+    pub fn canonical_hash(&self) -> String {
+        let canonical_str = format!(
+            "bsc:{}:{}:{}:{}:{}:{}:{}",
+            self.chain_id,
+            self.token_contract.as_deref().unwrap_or(""),
+            self.recipient_address,
+            self.amount_raw,
+            self.nonce,
+            self.gas_limit,
+            self.gas_price_wei
+        );
+        let mut hasher = tiny_keccak::Keccak::v256();
+        let mut hash = [0u8; 32];
+        tiny_keccak::Hasher::update(&mut hasher, canonical_str.as_bytes());
+        tiny_keccak::Hasher::finalize(hasher, &mut hash);
+        format!("0x{}", hex::encode(hash))
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct BscTxPreview {

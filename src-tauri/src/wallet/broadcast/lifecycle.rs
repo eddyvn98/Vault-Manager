@@ -31,6 +31,23 @@ impl TxLifecycleCoordinator {
         self.records.get(id)
     }
 
+    #[allow(dead_code)]
+    pub fn export_records(&self) -> Vec<TxLifecycleRecord> {
+        self.records.values().cloned().collect()
+    }
+
+    #[allow(dead_code)]
+    pub fn import_records(&mut self, records: Vec<TxLifecycleRecord>) {
+        for r in records {
+            if let TxLifecycleStatus::Confirmed { block_height, ref block_hash, .. } = r.status {
+                if let Some(ref tx_hash) = r.tx_hash {
+                    self.confirmed_block_hashes.insert(tx_hash.clone(), (block_height, block_hash.clone()));
+                }
+            }
+            self.records.insert(r.record_id.clone(), r);
+        }
+    }
+
     pub fn register_draft(
         &mut self,
         draft_id: &str,
@@ -319,9 +336,10 @@ impl TxLifecycleCoordinator {
         let tx_hash = match &record.status {
             TxLifecycleStatus::Pending { tx_hash, .. } => tx_hash.clone(),
             TxLifecycleStatus::Confirmed { tx_hash, .. } => tx_hash.clone(),
+            TxLifecycleStatus::ReorgDetected { tx_hash, .. } => tx_hash.clone(),
             other => {
                 return Err(format!(
-                    "Cannot poll BSC lifecycle in status '{:?}', must be Pending or Confirmed",
+                    "Cannot poll BSC lifecycle in status '{:?}', must be Pending, Confirmed, or ReorgDetected",
                     other
                 ))
             }
@@ -332,7 +350,20 @@ impl TxLifecycleCoordinator {
             .map_err(|e| format!("Query BSC receipt error: {}", e))?;
 
         match receipt {
-            BscReceiptStatus::Pending => Ok(record.status.clone()),
+            BscReceiptStatus::Pending => {
+                // If the transaction was previously Confirmed and now receipt returned Pending or disappeared,
+                // this indicates a chain reorganization fork has dropped or invalidated the receipt!
+                if let TxLifecycleStatus::Confirmed { block_height, block_hash, .. } = &record.status {
+                    let reorg = TxLifecycleStatus::ReorgDetected {
+                        tx_hash: tx_hash.clone(),
+                        previous_block_height: *block_height,
+                        previous_block_hash: block_hash.clone(),
+                    };
+                    record.transition_to(reorg.clone(), now_unix)?;
+                    return Ok(reorg);
+                }
+                Ok(record.status.clone())
+            }
             BscReceiptStatus::Success {
                 block_number,
                 block_hash,
