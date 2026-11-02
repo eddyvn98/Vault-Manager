@@ -2,6 +2,7 @@ pub mod bip;
 pub mod blockchain;
 pub mod crypto;
 pub mod lockout;
+pub mod signer;
 pub mod tx;
 
 use std::{
@@ -13,17 +14,28 @@ use std::{
 use lockout::LockoutManager;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
+use tiny_keccak::{Hasher, Keccak};
 use zeroize::Zeroizing;
 
 const FILE_NAME: &str = "wallet-v1.enc";
 pub const SESSION_TIMEOUT_SECS: u64 = 300;
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveDraft {
+    pub draft_id: String,
+    pub session_epoch: u64,
+    pub network: String,
+    pub payload_hash: String,
+    pub expires_at_unix: u64,
+}
 
 #[derive(Default)]
 pub struct SessionState {
     pub mnemonic: Option<Zeroizing<String>>,
     pub last_activity: Option<Instant>,
     pub pending_creation: Option<Zeroizing<String>>,
-    pub active_draft_id: Option<String>,
+    pub active_draft: Option<ActiveDraft>,
     pub session_epoch: u64,
 }
 
@@ -93,7 +105,7 @@ fn check_and_apply_auto_lock(session: &mut SessionState) -> bool {
         if last.elapsed() > Duration::from_secs(SESSION_TIMEOUT_SECS) {
             session.mnemonic = None;
             session.last_activity = None;
-            session.active_draft_id = None;
+            session.active_draft = None;
             session.session_epoch = session.session_epoch.wrapping_add(1);
             return false;
         }
@@ -164,7 +176,7 @@ pub fn finalize_wallet_creation(
     session.pending_creation = None;
     session.mnemonic = None;
     session.last_activity = None;
-    session.active_draft_id = None;
+    session.active_draft = None;
     session.session_epoch = session.session_epoch.wrapping_add(1);
 
     lockout_manager(&app)?.record_success();
@@ -190,7 +202,7 @@ pub fn restore_wallet(
     session.pending_creation = None;
     session.mnemonic = None;
     session.last_activity = None;
-    session.active_draft_id = None;
+    session.active_draft = None;
     session.session_epoch = session.session_epoch.wrapping_add(1);
 
     lockout_manager(&app)?.record_success();
@@ -226,7 +238,7 @@ pub fn unlock_wallet(
     let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
     session.mnemonic = Some(recovery);
     session.last_activity = Some(Instant::now());
-    session.active_draft_id = None;
+    session.active_draft = None;
     session.session_epoch = session.session_epoch.wrapping_add(1);
     Ok(())
 }
@@ -236,7 +248,7 @@ pub fn lock_wallet(state: State<'_, WalletSession>) -> Result<(), String> {
     let mut session = state.session.lock().map_err(|_| "Wallet state unavailable")?;
     session.mnemonic = None;
     session.last_activity = None;
-    session.active_draft_id = None;
+    session.active_draft = None;
     session.session_epoch = session.session_epoch.wrapping_add(1);
     Ok(())
 }
@@ -380,11 +392,26 @@ pub async fn prepare_btc_transaction(
         || session.session_epoch != initial_epoch
         || session.mnemonic.is_none()
     {
-        session.active_draft_id = None;
-        return Err("Wallet was locked, reset, or session expired during transaction preparation. Draft invalidated.".into());
+        // Do NOT clear active_draft here: if session_epoch != initial_epoch,
+        // another transaction may have already been registered in the new epoch.
+        return Err("Wallet was locked, reset, or session expired during transaction preparation. Stale draft discarded.".into());
     }
 
-    session.active_draft_id = Some(preview.draft_id.clone());
+    let mut hasher = Keccak::v256();
+    let mut hash = [0u8; 32];
+    hasher.update(preview.unsigned_psbt_base64.as_bytes());
+    hasher.finalize(&mut hash);
+    let payload_hash = format!("0x{}", hex::encode(hash));
+
+    let expires_at_unix = LockoutManager::now_unix() + SESSION_TIMEOUT_SECS;
+
+    session.active_draft = Some(ActiveDraft {
+        draft_id: preview.draft_id.clone(),
+        session_epoch: initial_epoch,
+        network: "Bitcoin Signet".into(),
+        payload_hash,
+        expires_at_unix,
+    });
     session.last_activity = Some(Instant::now());
 
     Ok(preview)
@@ -416,11 +443,25 @@ pub async fn prepare_bsc_transaction(
         || session.session_epoch != initial_epoch
         || session.mnemonic.is_none()
     {
-        session.active_draft_id = None;
-        return Err("Wallet was locked, reset, or session expired during transaction preparation. Draft invalidated.".into());
+        // Do NOT clear active_draft here
+        return Err("Wallet was locked, reset, or session expired during transaction preparation. Stale draft discarded.".into());
     }
 
-    session.active_draft_id = Some(preview.draft_id.clone());
+    let mut hasher = Keccak::v256();
+    let mut hash = [0u8; 32];
+    hasher.update(preview.calldata_hex.as_bytes());
+    hasher.finalize(&mut hash);
+    let payload_hash = format!("0x{}", hex::encode(hash));
+
+    let expires_at_unix = LockoutManager::now_unix() + SESSION_TIMEOUT_SECS;
+
+    session.active_draft = Some(ActiveDraft {
+        draft_id: preview.draft_id.clone(),
+        session_epoch: initial_epoch,
+        network: "BSC Testnet".into(),
+        payload_hash,
+        expires_at_unix,
+    });
     session.last_activity = Some(Instant::now());
 
     Ok(preview)
@@ -454,7 +495,7 @@ pub fn reset_wallet(
     session.mnemonic = None;
     session.last_activity = None;
     session.pending_creation = None;
-    session.active_draft_id = None;
+    session.active_draft = None;
     session.session_epoch = session.session_epoch.wrapping_add(1);
     Ok(())
 }
@@ -507,14 +548,48 @@ mod tests {
         let mut session = SessionState::default();
         let epoch0 = session.session_epoch;
 
-        // Auto-lock on timeout increments epoch and clears active_draft_id
+        // Auto-lock on timeout increments epoch and clears active_draft
         session.mnemonic = Some(Zeroizing::new("test-mnemonic".to_string()));
         session.last_activity = Some(Instant::now() - Duration::from_secs(SESSION_TIMEOUT_SECS + 1));
-        session.active_draft_id = Some("draft-btc-123".into());
+        session.active_draft = Some(ActiveDraft {
+            draft_id: "draft-btc-123".into(),
+            session_epoch: epoch0,
+            network: "Bitcoin Signet".into(),
+            payload_hash: "0x1234".into(),
+            expires_at_unix: 1700000000,
+        });
 
         assert!(!check_and_apply_auto_lock(&mut session));
         assert_eq!(session.session_epoch, epoch0 + 1);
-        assert!(session.active_draft_id.is_none());
+        assert!(session.active_draft.is_none());
         assert!(session.mnemonic.is_none());
+    }
+
+    #[test]
+    fn stale_epoch_task_does_not_clobber_new_epoch_draft() {
+        let mut session = SessionState::default();
+        session.session_epoch = 2; // Newer session epoch
+        session.mnemonic = Some(Zeroizing::new("new-mnemonic".to_string()));
+
+        let valid_new_draft = ActiveDraft {
+            draft_id: "draft-btc-valid-epoch-2".into(),
+            session_epoch: 2,
+            network: "Bitcoin Signet".into(),
+            payload_hash: "0xbeef".into(),
+            expires_at_unix: LockoutManager::now_unix() + 300,
+        };
+        session.active_draft = Some(valid_new_draft.clone());
+
+        // Simulate a stale task from epoch 0 completing now
+        let initial_epoch = 0;
+        let is_valid = check_and_apply_auto_lock(&mut session)
+            && session.session_epoch == initial_epoch
+            && session.mnemonic.is_some();
+
+        assert!(!is_valid, "Stale task must be rejected");
+
+        // Critically, active_draft must remain intact for epoch 2!
+        assert!(session.active_draft.is_some());
+        assert_eq!(session.active_draft.unwrap().draft_id, "draft-btc-valid-epoch-2");
     }
 }

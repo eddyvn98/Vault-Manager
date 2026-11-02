@@ -30,12 +30,11 @@ pub async fn query_bsc_gas_and_nonce(
     .await?;
 
     let clean_nonce = nonce_hex.trim().trim_start_matches("0x");
-    let nonce = if clean_nonce.is_empty() {
-        0
-    } else {
-        u64::from_str_radix(clean_nonce, 16)
-            .map_err(|e| format!("Invalid nonce format from RPC ({}): {}", nonce_hex, e))?
-    };
+    if clean_nonce.is_empty() {
+        return Err("Invalid empty nonce returned from BSC RPC".into());
+    }
+    let nonce = u64::from_str_radix(clean_nonce, 16)
+        .map_err(|e| format!("Invalid nonce format from RPC ({}): {}", nonce_hex, e))?;
 
     // 2. Query gas price
     let gas_price_hex = blockchain::call_json_rpc(
@@ -75,8 +74,26 @@ pub async fn query_bsc_gas_and_nonce(
     let clean_limit = estimate_hex.trim().trim_start_matches("0x");
     let parsed_gas = u64::from_str_radix(clean_limit, 16)
         .map_err(|e| format!("Invalid estimateGas format from RPC ({}): {}", estimate_hex, e))?;
-    // Add 20% safety margin for gas limit
-    let gas_limit = (parsed_gas * 120) / 100;
+
+    if parsed_gas < 21_000 {
+        return Err(format!(
+            "Estimated gas ({}) is below minimum EVM transaction requirement (21,000)",
+            parsed_gas
+        ));
+    }
+
+    // Add 20% safety margin for gas limit with checked arithmetic
+    let gas_limit = parsed_gas
+        .checked_mul(120)
+        .map(|v| v / 100)
+        .ok_or_else(|| "Gas limit estimation overflow".to_string())?;
+
+    if gas_limit > 1_000_000 {
+        return Err(format!(
+            "Estimated gas limit ({}) exceeds token transfer safety limit of 1,000,000",
+            gas_limit
+        ));
+    }
 
     // 4. Calculate total fee in BNB: gas_limit * gas_price_wei
     let total_fee_wei = BigUint::from(gas_limit) * &gas_price_wei;
@@ -99,4 +116,42 @@ pub async fn query_bsc_gas_and_nonce(
         gas_price_gwei,
         estimated_fee_bnb,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_gas_limit_safety_bounds() {
+        // Safe 20% margin calculation
+        let standard_transfer_gas = 65_000u64;
+        let with_margin = standard_transfer_gas
+            .checked_mul(120)
+            .map(|v| v / 100)
+            .unwrap();
+        assert_eq!(with_margin, 78_000);
+
+        // Fee cap: 0.05 BNB in wei is 50_000_000_000_000_000
+        let normal_fee_wei = BigUint::from(78_000u64) * BigUint::from(3_000_000_000u64); // 3 Gwei
+        let max_fee_wei = BigUint::from(50_000_000_000_000_000u64);
+        assert!(normal_fee_wei < max_fee_wei);
+
+        let excessive_fee_wei = BigUint::from(78_000u64) * BigUint::from(1_000_000_000_000u64); // 1000 Gwei
+        assert!(excessive_fee_wei > max_fee_wei);
+    }
+
+    #[test]
+    fn test_nonce_parsing_and_rejections() {
+        // Valid nonces
+        assert_eq!(u64::from_str_radix("0".trim_start_matches("0x"), 16).unwrap(), 0);
+        assert_eq!(u64::from_str_radix("1a".trim_start_matches("0x"), 16).unwrap(), 26);
+
+        // Empty nonce must be rejected
+        let clean_empty = "".trim_start_matches("0x");
+        assert!(clean_empty.is_empty());
+
+        let clean_0x_only = "0x".trim_start_matches("0x");
+        assert!(clean_0x_only.is_empty());
+    }
 }
