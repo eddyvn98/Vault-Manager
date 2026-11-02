@@ -53,9 +53,10 @@ export default function WalletApp() {
   }, [cooldown, refresh]);
 
   // Window visibility / background lock: locked by default on hidden in all environments.
-  // Controlled QA bypass only allowed when explicitly enabled via sessionStorage.
+  // Controlled QA bypass is strictly prohibited in production and only accessible in DEV mode via sessionStorage.
   useEffect(() => {
-    const qaBypass = typeof window !== 'undefined' && window.sessionStorage.getItem('qa_disable_blur_lock') === 'true';
+    const isDev = Boolean((import.meta as unknown as { env?: { DEV?: boolean } }).env?.DEV);
+    const qaBypass = isDev && typeof window !== 'undefined' && window.sessionStorage.getItem('qa_disable_blur_lock') === 'true';
     const handleVisibilityChange = () => {
       if (document.visibilityState === 'hidden' && status.unlocked && !qaBypass) {
         void invoke('lock_wallet').then(refresh).catch(() => {});

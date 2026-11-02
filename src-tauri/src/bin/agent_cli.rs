@@ -90,6 +90,43 @@ fn load_coordinator_fail_closed(l_path: &PathBuf) -> Result<TxLifecycleCoordinat
     }
 }
 
+async fn bsc_rpc_call(
+    client: &reqwest::Client,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let payload = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": method,
+        "params": params,
+        "id": 1,
+    });
+    let resp = client
+        .post(BSC_TESTNET_RPC)
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Network request failed for {}: {}", method, e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {} error for RPC {}", resp.status(), method));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse JSON response for {}: {}", method, e))?;
+
+    if let Some(err) = json.get("error") {
+        return Err(format!("RPC error returned by {}: {}", method, err));
+    }
+
+    match json.get("result") {
+        Some(res) if !res.is_null() => Ok(res.clone()),
+        _ => Err(format!("Missing or null 'result' field in RPC response for {}", method)),
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -158,7 +195,7 @@ async fn main() {
 
             let addresses = if let Some(a) = get_arg("--address") {
                 vec![a]
-            } else if has_flag("--all") {
+            } else if has_flag("--known-addresses") || has_flag("--all") {
                 let pw = match get_password(&get_arg, &has_flag) {
                     Ok(p) => p,
                     Err(e) => {
@@ -515,128 +552,124 @@ async fn main() {
             let client = reqwest::Client::new();
 
             // 1. eth_chainId
-            let chain_id_payload = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_chainId",
-                "params": [],
-                "id": 1
-            });
-            let chain_id_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
-                .json(&chain_id_payload)
-                .send()
-                .await
-                .map_err(|e| e.to_string())
-                .unwrap()
-                .json()
-                .await
-                .unwrap_or_default();
-            let chain_id_hex = chain_id_resp["result"].as_str().unwrap_or("0x0");
-            let chain_id = u64::from_str_radix(chain_id_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+            let chain_id_val = match bsc_rpc_call(&client, "eth_chainId", serde_json::json!([])).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: RPC eth_chainId failed: {}", e)}));
+                    std::process::exit(1);
+                }
+            };
+            let chain_id_hex = chain_id_val.as_str().unwrap_or_default();
+            let chain_id = match u64::from_str_radix(chain_id_hex.trim_start_matches("0x"), 16) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: Invalid eth_chainId hex '{}': {}", chain_id_hex, e)}));
+                    std::process::exit(1);
+                }
+            };
+            if chain_id != 97 {
+                eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: Connected RPC returned chain ID {} instead of BSC Testnet (97)", chain_id)}));
+                std::process::exit(1);
+            }
 
             // 2. eth_getBalance (tBNB)
-            let balance_payload = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_getBalance",
-                "params": [&addr, "latest"],
-                "id": 2
-            });
-            let balance_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
-                .json(&balance_payload)
-                .send()
-                .await
-                .map_err(|e| e.to_string())
-                .unwrap()
-                .json()
-                .await
-                .unwrap_or_default();
-            let tbnb_wei_hex = balance_resp["result"].as_str().unwrap_or("0x0");
-            let tbnb_wei = u128::from_str_radix(tbnb_wei_hex.trim_start_matches("0x"), 16).unwrap_or(0);
-            let tbnb_decimal = (tbnb_wei as f64) / 1e18;
+            let balance_val = match bsc_rpc_call(&client, "eth_getBalance", serde_json::json!([&addr, "latest"])).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: RPC eth_getBalance failed: {}", e)}));
+                    std::process::exit(1);
+                }
+            };
+            let tbnb_wei_hex = balance_val.as_str().unwrap_or_default();
+            let tbnb_wei = match u128::from_str_radix(tbnb_wei_hex.trim_start_matches("0x"), 16) {
+                Ok(w) => w,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: Invalid balance hex '{}': {}", tbnb_wei_hex, e)}));
+                    std::process::exit(1);
+                }
+            };
 
             // 3. eth_getTransactionCount (nonce)
-            let nonce_payload = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_getTransactionCount",
-                "params": [&addr, "latest"],
-                "id": 3
-            });
-            let nonce_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
-                .json(&nonce_payload)
-                .send()
-                .await
-                .map_err(|e| e.to_string())
-                .unwrap()
-                .json()
-                .await
-                .unwrap_or_default();
-            let nonce_hex = nonce_resp["result"].as_str().unwrap_or("0x0");
-            let nonce = u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16).unwrap_or(0);
+            let nonce_val = match bsc_rpc_call(&client, "eth_getTransactionCount", serde_json::json!([&addr, "latest"])).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: RPC eth_getTransactionCount failed: {}", e)}));
+                    std::process::exit(1);
+                }
+            };
+            let nonce_hex = nonce_val.as_str().unwrap_or_default();
+            let nonce = match u64::from_str_radix(nonce_hex.trim_start_matches("0x"), 16) {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: Invalid nonce hex '{}': {}", nonce_hex, e)}));
+                    std::process::exit(1);
+                }
+            };
 
             // 4. eth_getCode (USDT contract bytecode check)
-            let code_payload = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_getCode",
-                "params": [BSC_TESTNET_USDT, "latest"],
-                "id": 4
-            });
-            let code_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
-                .json(&code_payload)
-                .send()
-                .await
-                .map_err(|e| e.to_string())
-                .unwrap()
-                .json()
-                .await
-                .unwrap_or_default();
-            let code_hex = code_resp["result"].as_str().unwrap_or("0x");
-            let contract_exists = code_hex.len() > 10;
+            let code_val = match bsc_rpc_call(&client, "eth_getCode", serde_json::json!([BSC_TESTNET_USDT, "latest"])).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: RPC eth_getCode failed: {}", e)}));
+                    std::process::exit(1);
+                }
+            };
+            let code_hex = code_val.as_str().unwrap_or_default();
+            if code_hex.len() <= 10 || code_hex == "0x" {
+                eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: No contract bytecode found at USDT address {}", BSC_TESTNET_USDT)}));
+                std::process::exit(1);
+            }
 
             // 5. decimals() of USDT: 0x313ce567
-            let decimals_payload = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{
-                    "to": BSC_TESTNET_USDT,
-                    "data": "0x313ce567"
-                }, "latest"],
-                "id": 5
-            });
-            let decimals_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
-                .json(&decimals_payload)
-                .send()
-                .await
-                .map_err(|e| e.to_string())
-                .unwrap()
-                .json()
-                .await
-                .unwrap_or_default();
-            let decimals_hex = decimals_resp["result"].as_str().unwrap_or("0x12");
-            let decimals = u32::from_str_radix(decimals_hex.trim_start_matches("0x"), 16).unwrap_or(18);
+            let decimals_val = match bsc_rpc_call(&client, "eth_call", serde_json::json!([{
+                "to": BSC_TESTNET_USDT,
+                "data": "0x313ce567"
+            }, "latest"])).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: RPC decimals() call failed: {}", e)}));
+                    std::process::exit(1);
+                }
+            };
+            let decimals_hex = decimals_val.as_str().unwrap_or_default();
+            let decimals = match u32::from_str_radix(decimals_hex.trim_start_matches("0x"), 16) {
+                Ok(d) => d,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: Invalid decimals hex '{}': {}", decimals_hex, e)}));
+                    std::process::exit(1);
+                }
+            };
+            if decimals != 18 {
+                eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: USDT contract decimals returned {} instead of expected 18", decimals)}));
+                std::process::exit(1);
+            }
 
             // 6. balanceOf(address) of USDT: 0x70a08231 + 32-byte padded address
             let clean_addr = addr.trim_start_matches("0x");
             let call_data = format!("0x70a08231000000000000000000000000{}", clean_addr);
-            let token_payload = serde_json::json!({
-                "jsonrpc": "2.0",
-                "method": "eth_call",
-                "params": [{
-                    "to": BSC_TESTNET_USDT,
-                    "data": call_data
-                }, "latest"],
-                "id": 6
-            });
-            let token_resp: serde_json::Value = client.post(BSC_TESTNET_RPC)
-                .json(&token_payload)
-                .send()
-                .await
-                .map_err(|e| e.to_string())
-                .unwrap()
-                .json()
-                .await
-                .unwrap_or_default();
-            let usdt_units_hex = token_resp["result"].as_str().unwrap_or("0x0");
-            let usdt_units = u128::from_str_radix(usdt_units_hex.trim_start_matches("0x"), 16).unwrap_or(0);
-            let usdt_decimal = (usdt_units as f64) / 10f64.powi(decimals as i32);
+            let token_val = match bsc_rpc_call(&client, "eth_call", serde_json::json!([{
+                "to": BSC_TESTNET_USDT,
+                "data": call_data
+            }, "latest"])).await {
+                Ok(v) => v,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: RPC balanceOf() call failed: {}", e)}));
+                    std::process::exit(1);
+                }
+            };
+            let usdt_units_hex = token_val.as_str().unwrap_or_default();
+            let usdt_units = match u128::from_str_radix(usdt_units_hex.trim_start_matches("0x"), 16) {
+                Ok(u) => u,
+                Err(e) => {
+                    eprintln!("{}", serde_json::json!({"error": format!("FAIL-CLOSED: Invalid balanceOf hex '{}': {}", usdt_units_hex, e)}));
+                    std::process::exit(1);
+                }
+            };
+
+            let whole_tbnb = tbnb_wei / 1_000_000_000_000_000_000;
+            let frac_tbnb = tbnb_wei % 1_000_000_000_000_000_000;
+            let whole_usdt = usdt_units / 1_000_000_000_000_000_000;
+            let frac_usdt = usdt_units % 1_000_000_000_000_000_000;
 
             let out = serde_json::json!({
                 "address": addr,
@@ -644,12 +677,12 @@ async fn main() {
                 "chain_id_hex": chain_id_hex,
                 "nonce": nonce,
                 "tbnb_wei": tbnb_wei.to_string(),
-                "tbnb_balance": format!("{:.6} tBNB", tbnb_decimal),
+                "tbnb_formatted": format!("{}.{:018}", whole_tbnb, frac_tbnb),
                 "usdt_contract": BSC_TESTNET_USDT,
-                "usdt_contract_exists": contract_exists,
+                "usdt_contract_verified": true,
                 "usdt_decimals": decimals,
                 "usdt_raw_units": usdt_units.to_string(),
-                "usdt_balance": format!("{:.6} USDT", usdt_decimal),
+                "usdt_formatted": format!("{}.{:018}", whole_usdt, frac_usdt),
                 "explorer_url": format!("https://testnet.bscscan.com/address/{}", addr),
             });
             println!("{}", serde_json::to_string_pretty(&out).unwrap());
