@@ -12,6 +12,7 @@ use std::{
     sync::Mutex,
     time::{Duration, Instant},
 };
+use bitcoin::hashes::Hash;
 use lockout::LockoutManager;
 use serde::Serialize;
 use tauri::{AppHandle, Manager, State};
@@ -118,13 +119,39 @@ pub fn sign_verified_btc_draft(
 
     let secp = bitcoin::secp256k1::Secp256k1::new();
     let mut privkeys = Vec::with_capacity(policy.approved_inputs.len());
-    for approved in &policy.approved_inputs {
+    for (i, approved) in policy.approved_inputs.iter().enumerate() {
         let key = bip::derive_bip84_privkey_at(
             mnemonic_str,
             bitcoin::Network::Signet,
             approved.change,
             approved.derivation_index,
         )?;
+
+        // Cryptographic derivation binding:
+        // Ensure the approved prevout matches the exact P2WPKH script_pubkey derived from the seed
+        let derived_pubkey = key.public_key(&secp);
+        let expected_script = bitcoin::ScriptBuf::new_p2wpkh(
+            &bitcoin::WPubkeyHash::hash(&derived_pubkey.serialize()),
+        );
+
+        if approved.script_pubkey != expected_script {
+            return Err(format!(
+                "Pre-sign validation failed: ApprovedPrevout[{}] script_pubkey mismatch for derivation path m/84'/1'/0'/{}/{}: expected {}, got {}",
+                i, approved.change, approved.derivation_index, expected_script, approved.script_pubkey
+            ));
+        }
+
+        if let Some(psbt_input) = psbt.inputs.get(i) {
+            if let Some(utxo) = &psbt_input.witness_utxo {
+                if utxo.script_pubkey != expected_script {
+                    return Err(format!(
+                        "Pre-sign validation failed: PSBT input[{}] witness_utxo script_pubkey mismatch: expected {}, got {}",
+                        i, expected_script, utxo.script_pubkey
+                    ));
+                }
+            }
+        }
+
         privkeys.push(key);
     }
 
@@ -639,18 +666,52 @@ pub async fn prepare_bsc_transaction(
 }
 
 pub fn cleanup_sqlite_files(app_dir: &std::path::Path) -> Result<(), String> {
-    let bdk_wal = app_dir.join("bdk_signet.sqlite3-wal");
-    if bdk_wal.exists() {
-        fs::remove_file(&bdk_wal).map_err(|e| format!("Cannot remove SQLite WAL journal: {}", e))?;
+    // 1. Clean up any leftover staged directories from previous interrupted resets
+    if let Ok(entries) = fs::read_dir(app_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                    if name.starts_with(".sqlite_staging_") {
+                        let _ = fs::remove_dir_all(&path);
+                    }
+                }
+            }
+        }
     }
-    let bdk_shm = app_dir.join("bdk_signet.sqlite3-shm");
-    if bdk_shm.exists() {
-        fs::remove_file(&bdk_shm).map_err(|e| format!("Cannot remove SQLite SHM index: {}", e))?;
-    }
+
     let bdk_db = app_dir.join("bdk_signet.sqlite3");
-    if bdk_db.exists() {
-        fs::remove_file(&bdk_db).map_err(|e| format!("Cannot remove BDK SQLite database: {}", e))?;
+    let bdk_wal = app_dir.join("bdk_signet.sqlite3-wal");
+    let bdk_shm = app_dir.join("bdk_signet.sqlite3-shm");
+
+    // If nothing exists, nothing to do
+    if !bdk_db.exists() && !bdk_wal.exists() && !bdk_shm.exists() {
+        return Ok(());
     }
+
+    // 2. Atomic staging: create a staging directory and move all database files into it
+    let now = LockoutManager::now_unix();
+    let staging_dir = app_dir.join(format!(".sqlite_staging_{}", now));
+    fs::create_dir_all(&staging_dir).map_err(|e| format!("Cannot create SQLite staging directory: {}", e))?;
+
+    // Attempt to atomically move files into staging directory
+    if bdk_db.exists() {
+        fs::rename(&bdk_db, staging_dir.join("bdk_signet.sqlite3"))
+            .map_err(|e| format!("Cannot stage SQLite database for deletion: {}", e))?;
+    }
+    if bdk_wal.exists() {
+        fs::rename(&bdk_wal, staging_dir.join("bdk_signet.sqlite3-wal"))
+            .map_err(|e| format!("Cannot stage SQLite WAL for deletion: {}", e))?;
+    }
+    if bdk_shm.exists() {
+        fs::rename(&bdk_shm, staging_dir.join("bdk_signet.sqlite3-shm"))
+            .map_err(|e| format!("Cannot stage SQLite SHM for deletion: {}", e))?;
+    }
+
+    // 3. Purge the staging directory
+    fs::remove_dir_all(&staging_dir)
+        .map_err(|e| format!("Cannot purge staged SQLite files: {}", e))?;
+
     Ok(())
 }
 
@@ -713,6 +774,9 @@ pub fn reset_wallet(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
+    use bitcoin::{OutPoint, Psbt, ScriptBuf, Transaction, TxIn, TxOut, Txid};
+    use std::str::FromStr;
 
     #[test]
     fn auto_lock_after_inactivity() {
@@ -1093,6 +1157,112 @@ mod tests {
         assert_eq!(final_tx.input.len(), 2);
         assert!(!final_tx.input[0].witness.is_empty(), "Input 0 witness must be present");
         assert!(!final_tx.input[1].witness.is_empty(), "Input 1 witness must be present");
+
+        // Independently verify ECDSA signatures on the raw transaction inputs
+        let mut sighash_cache = bitcoin::sighash::SighashCache::new(&final_tx);
+        for (i, approved) in policy.approved_inputs.iter().enumerate() {
+            let witness = &final_tx.input[i].witness;
+            assert_eq!(witness.len(), 2, "P2WPKH witness must contain [signature, pubkey]");
+            let sig_bytes = witness.nth(0).unwrap();
+            let pubkey_bytes = witness.nth(1).unwrap();
+
+            let sig_slice = &sig_bytes[..sig_bytes.len() - 1]; // strip sighash flag byte
+            let sig = secp256k1::ecdsa::Signature::from_der(sig_slice).expect("Must be valid DER signature");
+            let pubkey = secp256k1::PublicKey::from_slice(pubkey_bytes).expect("Must be valid compressed pubkey");
+
+            let sighash = sighash_cache.p2wpkh_signature_hash(
+                i,
+                &approved.script_pubkey,
+                bitcoin::Amount::from_sat(approved.value_satoshis),
+                bitcoin::sighash::EcdsaSighashType::All,
+            ).expect("Must compute BIP143 sighash");
+
+            let msg = secp256k1::Message::from_digest(sighash.to_byte_array());
+            secp.verify_ecdsa(&msg, &sig, &pubkey).expect("Independent signature verification on raw tx must succeed!");
+        }
+    }
+
+    #[test]
+    fn test_btc_rejects_forged_approved_prevout_metadata() {
+        let mnemonic = bip::generate_24_words().unwrap();
+        let mut session = SessionState::default();
+        session.session_epoch = 1;
+        session.mnemonic = Some(mnemonic.clone());
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let key_recv = bip::derive_bip84_privkey_at(&mnemonic, bitcoin::Network::Signet, 0, 0).unwrap();
+        let script_recv = bitcoin::ScriptBuf::new_p2wpkh(&bitcoin::WPubkeyHash::hash(&key_recv.public_key(&secp).serialize()));
+
+        let recipient_script = bitcoin::Address::from_str("tb1qw508d6qejxtdg4y5r3zarvary0c5xw7kxpjzsx")
+            .unwrap()
+            .assume_checked()
+            .script_pubkey();
+
+        let outpoint = OutPoint {
+            txid: Txid::from_str("0000000000000000000000000000000000000000000000000000000000000001").unwrap(),
+            vout: 0,
+        };
+
+        let unsigned_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: outpoint,
+                script_sig: ScriptBuf::new(),
+                sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: bitcoin::Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: bitcoin::Amount::from_sat(45_000),
+                script_pubkey: recipient_script.clone(),
+            }],
+        };
+
+        let mut psbt = Psbt::from_unsigned_tx(unsigned_tx).unwrap();
+        psbt.inputs[0].witness_utxo = Some(TxOut {
+            value: bitcoin::Amount::from_sat(50_000),
+            script_pubkey: script_recv.clone(),
+        });
+
+        let psbt_b64 = base64::engine::general_purpose::STANDARD.encode(&psbt.serialize());
+        let payload_hash = compute_btc_payload_hash(&psbt_b64);
+        let draft_id = "draft-btc-tamper-01";
+
+        session.active_draft = Some(ActiveDraft {
+            draft_id: draft_id.into(),
+            session_epoch: 1,
+            network: "Bitcoin Signet".into(),
+            payload_hash,
+            expires_at_unix: LockoutManager::now_unix() + 300,
+        });
+
+        // 1. TAMPER ATTEMPT: Attacker provides self-declared metadata claiming derivation index = 999
+        // which does NOT derive the script_pubkey
+        let forged_policy = signer::btc::BtcSigningPolicy {
+            expected_recipient: recipient_script,
+            expected_amount_sat: 45_000,
+            expected_change_script: None,
+            approved_inputs: vec![
+                signer::btc::ApprovedPrevout {
+                    outpoint,
+                    value_satoshis: 50_000,
+                    script_pubkey: script_recv,
+                    change: 0,
+                    derivation_index: 999, // FORGED INDEX!
+                },
+            ],
+        };
+
+        let sign_res = sign_verified_btc_draft(
+            &mut session,
+            draft_id,
+            &psbt_b64,
+            &forged_policy,
+        );
+
+        assert!(sign_res.is_err(), "Pre-sign validation MUST reject forged ApprovedPrevout metadata");
+        let err_str = sign_res.unwrap_err();
+        assert!(err_str.contains("Pre-sign validation failed"), "Error must report pre-sign derivation mismatch: {}", err_str);
     }
 
     #[test]
@@ -1104,10 +1274,10 @@ mod tests {
 
         let contract_to = "0x337610d27c682E347C9cD60bd4b3b107C9d34dDd";
         let recipient_addr = "0x9858EfFD232B4033E47d90003D41EC34EcaEda94";
-        let calldata_hex = format!("0x{}", hex::encode(tx::bsc::calldata::encode_erc20_transfer(
+        let calldata_hex = tx::bsc::calldata::encode_erc20_transfer(
             recipient_addr,
             &num_bigint::BigUint::from(1_000_000_000_000_000_000u64),
-        ).unwrap()));
+        ).unwrap();
 
         let canonical_payload = tx::BscCanonicalPayload {
             chain_id: 97,

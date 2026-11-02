@@ -159,3 +159,137 @@ impl BtcBroadcaster for MockBtcBroadcaster {
         Ok(map.get(txid).cloned().unwrap_or(BtcTxQueryStatus::NotFound))
     }
 }
+
+/// Real network adapter for Bitcoin Signet using Esplora API (mempool.space).
+/// Designed with strict testnet-only boundaries and feature-locking (G5A/G5B).
+#[allow(dead_code)]
+pub struct EsploraBtcBroadcaster {
+    pub esplora_url: String,
+    pub broadcast_enabled: bool,
+    client: reqwest::blocking::Client,
+}
+
+#[allow(dead_code)]
+impl EsploraBtcBroadcaster {
+    pub fn new(broadcast_enabled: bool) -> Self {
+        Self::with_endpoint("https://mempool.space/signet/api", broadcast_enabled)
+    }
+
+    pub fn with_endpoint(endpoint: &str, broadcast_enabled: bool) -> Self {
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .unwrap_or_else(|_| reqwest::blocking::Client::new());
+
+        Self {
+            esplora_url: endpoint.to_string(),
+            broadcast_enabled,
+            client,
+        }
+    }
+
+    /// Dry-run verification (G5A): Deserializes raw tx, validates inputs/outputs,
+    /// checks testnet network, and calculates txid locally without any network POST.
+    pub fn dry_run_verify(&self, raw_tx_hex: &str, network: BroadcastNetwork) -> Result<(bitcoin::Transaction, String), BtcBroadcastError> {
+        if network != BroadcastNetwork::BitcoinSignet {
+            return Err(BtcBroadcastError::NetworkForbidden(
+                format!("Network {:?} is strictly forbidden. Only Bitcoin Signet is permitted.", network)
+            ));
+        }
+
+        let clean_hex = raw_tx_hex.trim();
+        let raw_bytes = hex::decode(clean_hex)
+            .map_err(|e| BtcBroadcastError::NodeRejected(format!("Invalid raw tx hex: {}", e)))?;
+
+        let tx: bitcoin::Transaction = bitcoin::consensus::deserialize(&raw_bytes)
+            .map_err(|e| BtcBroadcastError::NodeRejected(format!("Cannot deserialize raw BTC transaction: {}", e)))?;
+
+        if tx.input.is_empty() {
+            return Err(BtcBroadcastError::NodeRejected("Transaction has no inputs".to_string()));
+        }
+        if tx.output.is_empty() {
+            return Err(BtcBroadcastError::NodeRejected("Transaction has no outputs".to_string()));
+        }
+
+        let computed_txid = tx.compute_txid().to_string();
+        Ok((tx, computed_txid))
+    }
+}
+
+impl BtcBroadcaster for EsploraBtcBroadcaster {
+    fn broadcast(&self, raw_tx_hex: &str, network: BroadcastNetwork) -> Result<String, BtcBroadcastError> {
+        let (_tx, computed_txid) = self.dry_run_verify(raw_tx_hex, network)?;
+
+        // If broadcast is locked (feature-gated / default mode): return dry-run computed txid
+        if !self.broadcast_enabled {
+            return Ok(format!("dry_run_{}", computed_txid));
+        }
+
+        // Live broadcast (G5B locked mode):
+        let post_url = format!("{}/tx", self.esplora_url);
+        let resp = match self.client.post(&post_url).body(raw_tx_hex.trim().to_string()).send() {
+            Ok(r) => r,
+            Err(e) => {
+                // If timeout occurred, DO NOT immediately retry or create a competing transaction:
+                // First query whether the transaction reached the mempool!
+                if let Ok(BtcTxQueryStatus::InMempool | BtcTxQueryStatus::Confirmed { .. }) = self.query_status(&computed_txid, network) {
+                    return Ok(computed_txid);
+                }
+                return Err(BtcBroadcastError::Timeout(format!("Esplora POST /tx timed out: {}", e)));
+            }
+        };
+
+        let status_code = resp.status().as_u16();
+        let body = resp.text().unwrap_or_default();
+
+        if status_code == 200 {
+            let returned_txid = body.trim().to_string();
+            if returned_txid != computed_txid {
+                return Err(BtcBroadcastError::NodeRejected(format!(
+                    "Returned txid '{}' does not match locally calculated txid '{}'",
+                    returned_txid, computed_txid
+                )));
+            }
+            Ok(computed_txid)
+        } else {
+            Err(parse_esplora_error(status_code, &body))
+        }
+    }
+
+    fn query_status(&self, txid: &str, network: BroadcastNetwork) -> Result<BtcTxQueryStatus, BtcBroadcastError> {
+        if network != BroadcastNetwork::BitcoinSignet {
+            return Err(BtcBroadcastError::NetworkForbidden(
+                format!("Network {:?} is strictly forbidden. Only Bitcoin Signet is permitted.", network)
+            ));
+        }
+
+        let url = format!("{}/tx/{}/status", self.esplora_url, txid);
+        let resp = self.client.get(&url).send()
+            .map_err(|e| BtcBroadcastError::Timeout(format!("Esplora query_status timed out: {}", e)))?;
+
+        let status_code = resp.status().as_u16();
+        if status_code == 404 {
+            return Ok(BtcTxQueryStatus::NotFound);
+        }
+        if !resp.status().is_success() {
+            let body = resp.text().unwrap_or_default();
+            return Err(parse_esplora_error(status_code, &body));
+        }
+
+        let json: serde_json::Value = resp.json()
+            .map_err(|e| BtcBroadcastError::NodeRejected(format!("Failed to parse status JSON: {}", e)))?;
+
+        let confirmed = json.get("confirmed").and_then(|v| v.as_bool()).unwrap_or(false);
+        if confirmed {
+            let block_height = json.get("block_height").and_then(|v| v.as_u64()).unwrap_or(0);
+            let block_hash = json.get("block_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            Ok(BtcTxQueryStatus::Confirmed {
+                block_height,
+                block_hash,
+                confirmations: 1,
+            })
+        } else {
+            Ok(BtcTxQueryStatus::InMempool)
+        }
+    }
+}

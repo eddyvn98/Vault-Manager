@@ -3,7 +3,14 @@ use crate::wallet::broadcast::{
     btc::{BtcBroadcastError, BtcBroadcaster, BtcTxQueryStatus},
     types::{BroadcastNetwork, TxLifecycleRecord, TxLifecycleStatus},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+#[derive(Serialize, Deserialize)]
+struct LifecycleSnapshot {
+    records: Vec<TxLifecycleRecord>,
+    confirmed_block_hashes: HashMap<String, (u64, String)>,
+}
 
 #[allow(dead_code)]
 pub struct TxLifecycleCoordinator {
@@ -37,15 +44,45 @@ impl TxLifecycleCoordinator {
     }
 
     #[allow(dead_code)]
-    pub fn import_records(&mut self, records: Vec<TxLifecycleRecord>) {
-        for r in records {
-            if let TxLifecycleStatus::Confirmed { block_height, ref block_hash, .. } = r.status {
-                if let Some(ref tx_hash) = r.tx_hash {
-                    self.confirmed_block_hashes.insert(tx_hash.clone(), (block_height, block_hash.clone()));
-                }
-            }
-            self.records.insert(r.record_id.clone(), r);
+    pub fn save_to_file(&self, path: &std::path::Path) -> Result<(), String> {
+        let snapshot = LifecycleSnapshot {
+            records: self.records.values().cloned().collect(),
+            confirmed_block_hashes: self.confirmed_block_hashes.clone(),
+        };
+        let json_bytes = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|e| format!("Failed to serialize lifecycle records: {}", e))?;
+
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Cannot create parent directory: {}", e))?;
         }
+
+        let temp_path = path.with_extension(format!("tmp.{}", rand::random::<u32>()));
+        std::fs::write(&temp_path, json_bytes)
+            .map_err(|e| format!("Cannot write temporary lifecycle file: {}", e))?;
+
+        std::fs::rename(&temp_path, path)
+            .map_err(|e| format!("Cannot atomically save lifecycle file: {}", e))?;
+
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn load_from_file(path: &std::path::Path) -> Result<Self, String> {
+        if !path.exists() {
+            return Ok(Self::new());
+        }
+        let data = std::fs::read(path)
+            .map_err(|e| format!("Cannot read lifecycle file: {}", e))?;
+        let snapshot: LifecycleSnapshot = serde_json::from_slice(&data)
+            .map_err(|e| format!("Cannot parse lifecycle file: {}", e))?;
+
+        let mut coordinator = Self::new();
+        for r in snapshot.records {
+            coordinator.records.insert(r.record_id.clone(), r);
+        }
+        coordinator.confirmed_block_hashes = snapshot.confirmed_block_hashes;
+        Ok(coordinator)
     }
 
     pub fn register_draft(

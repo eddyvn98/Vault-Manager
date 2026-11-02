@@ -237,12 +237,44 @@ impl BscSigningPolicy {
         payload: &crate::wallet::tx::BscCanonicalPayload,
         expected_sender: &str,
     ) -> Result<Self, String> {
+        if payload.chain_id != crate::wallet::tx::policy::BSC_TESTNET_CHAIN_ID {
+            return Err(format!(
+                "Invalid chain ID: expected {} (BSC Testnet), got {}",
+                crate::wallet::tx::policy::BSC_TESTNET_CHAIN_ID,
+                payload.chain_id
+            ));
+        }
+
         let contract = payload
             .token_contract
             .as_ref()
             .ok_or_else(|| "Missing token contract address in canonical payload".to_string())?;
 
-        let clean_hex = payload.calldata_hex.trim().trim_start_matches("0x");
+        if contract.to_lowercase() != crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT.to_lowercase() {
+            return Err(format!(
+                "Unauthorized contract: only testnet USDT {} is permitted, got {}",
+                crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT,
+                contract
+            ));
+        }
+
+        let amount_wei = BigUint::parse_bytes(payload.amount_raw.as_bytes(), 10)
+            .ok_or_else(|| "Invalid amount raw in canonical payload".to_string())?;
+
+        // Independently re-encode expected calldata from recipient and amount
+        let expected_calldata = crate::wallet::tx::bsc::calldata::encode_erc20_transfer(
+            &payload.recipient_address,
+            &amount_wei,
+        )?;
+
+        if payload.calldata_hex.trim().to_lowercase() != expected_calldata.trim().to_lowercase() {
+            return Err(format!(
+                "Calldata mismatch: payload calldata does not match authorized ERC20 transfer(to, amount): expected {}, got {}",
+                expected_calldata, payload.calldata_hex
+            ));
+        }
+
+        let clean_hex = payload.calldata_hex.trim().trim_start_matches("0x").trim_start_matches("0X");
         let data = hex::decode(clean_hex)
             .map_err(|e| format!("Invalid hex calldata in canonical payload: {}", e))?;
 
@@ -510,5 +542,68 @@ mod tests {
             tampered_sender, sender_97,
             "Tampered calldata must recover a different sender address, invalidating the transaction"
         );
+    }
+
+    #[test]
+    fn test_bsc_calldata_tamper_rejection_and_canonical_hash_binding() {
+        let recipient_addr = "0x9858EfFD232B4033E47d90003D41EC34EcaEda94";
+        let amount_raw = "1000000000000000000"; // 1.0 USDT
+        let amount_wei = BigUint::parse_bytes(amount_raw.as_bytes(), 10).unwrap();
+        let valid_calldata = crate::wallet::tx::bsc::calldata::encode_erc20_transfer(
+            recipient_addr,
+            &amount_wei,
+        ).unwrap();
+
+        let valid_payload = crate::wallet::tx::BscCanonicalPayload {
+            chain_id: 97,
+            token_contract: Some(crate::wallet::blockchain::BSC_TESTNET_USDT_CONTRACT.to_string()),
+            recipient_address: recipient_addr.to_string(),
+            amount_raw: amount_raw.to_string(),
+            nonce: 10,
+            gas_limit: 65_000,
+            gas_price_wei: "3000000000".to_string(),
+            calldata_hex: valid_calldata.clone(),
+        };
+
+        // 1. Valid payload must hash deterministically and construct policy
+        let hash_valid = valid_payload.canonical_hash();
+        let policy_res = BscSigningPolicy::from_canonical_payload(&valid_payload, "0x1111111111111111111111111111111111111111");
+        assert!(policy_res.is_ok(), "Valid canonical payload must succeed");
+
+        // 2. Tamper exactly ONE byte in calldata_hex (e.g. modify recipient address within calldata)
+        let mut tampered_calldata = valid_calldata.clone();
+        // Replace last character from '0' to '1'
+        let last_char = tampered_calldata.pop().unwrap();
+        let replacement_char = if last_char == '0' { '1' } else { '0' };
+        tampered_calldata.push(replacement_char);
+
+        let tampered_payload = crate::wallet::tx::BscCanonicalPayload {
+            calldata_hex: tampered_calldata,
+            ..valid_payload.clone()
+        };
+
+        // Canonical hash MUST be completely different
+        let hash_tampered = tampered_payload.canonical_hash();
+        assert_ne!(hash_valid, hash_tampered, "Tampering 1 byte of calldata MUST produce a different hash");
+
+        // from_canonical_payload MUST strictly reject tampered calldata
+        let tampered_policy_res = BscSigningPolicy::from_canonical_payload(&tampered_payload, "0x1111111111111111111111111111111111111111");
+        assert!(tampered_policy_res.is_err(), "Policy construction MUST reject tampered calldata");
+        let err_msg = tampered_policy_res.unwrap_err();
+        assert!(err_msg.contains("Calldata mismatch"), "Error must report calldata mismatch: {}", err_msg);
+
+        // 3. Chain ID tampering MUST be rejected
+        let mut mainnet_payload = valid_payload.clone();
+        mainnet_payload.chain_id = 56; // BSC Mainnet
+        let mainnet_res = BscSigningPolicy::from_canonical_payload(&mainnet_payload, "0x1111111111111111111111111111111111111111");
+        assert!(mainnet_res.is_err());
+        assert!(mainnet_res.unwrap_err().contains("Invalid chain ID"));
+
+        // 4. Unauthorized contract MUST be rejected
+        let mut wrong_contract_payload = valid_payload.clone();
+        wrong_contract_payload.token_contract = Some("0x55d398326f99059fF775485246999027B3197955".to_string()); // Mainnet USDT
+        let wrong_contract_res = BscSigningPolicy::from_canonical_payload(&wrong_contract_payload, "0x1111111111111111111111111111111111111111");
+        assert!(wrong_contract_res.is_err());
+        assert!(wrong_contract_res.unwrap_err().contains("Unauthorized contract"));
     }
 }

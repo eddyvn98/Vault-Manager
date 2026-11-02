@@ -44,14 +44,15 @@ pub struct BscCanonicalPayload {
 impl BscCanonicalPayload {
     pub fn canonical_hash(&self) -> String {
         let canonical_str = format!(
-            "bsc:{}:{}:{}:{}:{}:{}:{}",
+            "bsc:{}:{}:{}:{}:{}:{}:{}:{}",
             self.chain_id,
-            self.token_contract.as_deref().unwrap_or(""),
-            self.recipient_address,
+            self.token_contract.as_deref().unwrap_or("").to_lowercase(),
+            self.recipient_address.to_lowercase(),
             self.amount_raw,
             self.nonce,
             self.gas_limit,
-            self.gas_price_wei
+            self.gas_price_wei,
+            self.calldata_hex.to_lowercase()
         );
         let mut hasher = tiny_keccak::Keccak::v256();
         let mut hash = [0u8; 32];

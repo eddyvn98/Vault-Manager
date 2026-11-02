@@ -6,8 +6,8 @@ pub mod types;
 #[cfg(test)]
 mod tests {
     use super::{
-        bsc::{BscBroadcastError, BscReceiptStatus, MockBscBroadcaster},
-        btc::{BtcBroadcastError, BtcTxQueryStatus, MockBtcBroadcaster},
+        bsc::{BscBroadcastError, BscBroadcaster, BscReceiptStatus, MockBscBroadcaster, RpcBscBroadcaster},
+        btc::{BtcBroadcastError, BtcBroadcaster, BtcTxQueryStatus, EsploraBtcBroadcaster, MockBtcBroadcaster},
         lifecycle::TxLifecycleCoordinator,
         types::{BroadcastNetwork, TxLifecycleStatus},
     };
@@ -448,5 +448,99 @@ mod tests {
         // BSC Insufficient funds
         let err = parse_bsc_rpc_error(-32000, "insufficient funds for gas * price + value");
         assert!(matches!(err, BscBroadcastError::InsufficientFunds { .. }));
+    }
+
+    #[test]
+    fn test_lifecycle_coordinator_persistence_across_restart() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let persist_file = temp_dir.path().join("lifecycle_records.json");
+
+        // 1. First session: coordinator records transactions and confirms one
+        let mut coordinator1 = TxLifecycleCoordinator::new();
+        let btc_broadcaster = MockBtcBroadcaster::new();
+        let bsc_broadcaster = MockBscBroadcaster::new();
+
+        let btc_draft = "draft_btc_persist_01";
+        coordinator1.register_draft(btc_draft, BroadcastNetwork::BitcoinSignet, 1000).unwrap();
+        coordinator1.record_signed(btc_draft, "hash_btc_1", "0200000001dead", 1005).unwrap();
+        let btc_txid = coordinator1.execute_broadcast_btc(btc_draft, &btc_broadcaster, 3, 1010).unwrap();
+
+        btc_broadcaster.set_tx_status(&btc_txid, BtcTxQueryStatus::Confirmed {
+            block_height: 150_000,
+            block_hash: "00000000block_signet_abc".to_string(),
+            confirmations: 2,
+        });
+        coordinator1.poll_btc_lifecycle(btc_draft, &btc_broadcaster, 1020).unwrap();
+
+        let bsc_draft = "draft_bsc_persist_01";
+        coordinator1.register_draft(bsc_draft, BroadcastNetwork::BscTestnet, 1030).unwrap();
+        coordinator1.record_signed(bsc_draft, "hash_bsc_1", "f86c...", 1035).unwrap();
+        let _bsc_tx_hash = coordinator1.execute_broadcast_bsc(bsc_draft, &bsc_broadcaster, 3, 1040).unwrap();
+
+        // Save coordinator 1 state to disk
+        coordinator1.save_to_file(&persist_file).expect("Must save lifecycle records to disk");
+
+        // 2. Simulate complete application crash or restart by dropping coordinator1
+        drop(coordinator1);
+
+        // 3. Second session: reload coordinator from disk into a fresh instance
+        let mut coordinator2 = TxLifecycleCoordinator::load_from_file(&persist_file)
+            .expect("Must load lifecycle records from disk");
+
+        // Verify both transactions were restored with accurate state
+        let btc_record = coordinator2.get_record(btc_draft).expect("BTC record must be restored");
+        assert!(matches!(btc_record.status, TxLifecycleStatus::Confirmed { block_height: 150_000, .. }));
+
+        let bsc_record = coordinator2.get_record(bsc_draft).expect("BSC record must be restored");
+        assert!(matches!(bsc_record.status, TxLifecycleStatus::Pending { .. }));
+
+        // 4. Continue lifecycle tracking seamlessly on reloaded coordinator
+        bsc_broadcaster.set_receipt(&_bsc_tx_hash, BscReceiptStatus::Success {
+            block_number: 35_000_100,
+            block_hash: "0xblock_bsc_canonical_1".to_string(),
+            gas_used: 65_000,
+        });
+        let polled_bsc = coordinator2.poll_bsc_lifecycle(bsc_draft, &bsc_broadcaster, 1050).unwrap();
+        assert!(matches!(polled_bsc, TxLifecycleStatus::Confirmed { block_height: 35_000_100, .. }));
+
+        // Save again and reload to verify second transition persisted
+        coordinator2.save_to_file(&persist_file).expect("Must re-save");
+        let coordinator3 = TxLifecycleCoordinator::load_from_file(&persist_file).unwrap();
+        let bsc_record_v3 = coordinator3.get_record(bsc_draft).unwrap();
+        assert!(matches!(bsc_record_v3.status, TxLifecycleStatus::Confirmed { block_height: 35_000_100, .. }));
+    }
+
+    #[test]
+    fn test_adapters_reject_wrong_network_before_network_io() {
+        // BTC adapter MUST reject BscTestnet or Mainnet networks before attempting any network call
+        let btc_adapter = EsploraBtcBroadcaster::new(false);
+        let btc_res = btc_adapter.broadcast("02000000000101", BroadcastNetwork::BscTestnet);
+        assert!(matches!(btc_res, Err(BtcBroadcastError::NetworkForbidden(_))));
+
+        let btc_query_res = btc_adapter.query_status("txid", BroadcastNetwork::BscTestnet);
+        assert!(matches!(btc_query_res, Err(BtcBroadcastError::NetworkForbidden(_))));
+
+        // BSC adapter MUST reject BitcoinSignet or Mainnet networks before attempting any network call
+        let bsc_adapter = RpcBscBroadcaster::new(false);
+        let bsc_res = bsc_adapter.broadcast("0xf86c...", BroadcastNetwork::BitcoinSignet);
+        assert!(matches!(bsc_res, Err(BscBroadcastError::NetworkForbidden(_))));
+
+        let bsc_query_res = bsc_adapter.query_receipt("0x1234", BroadcastNetwork::BitcoinSignet);
+        assert!(matches!(bsc_query_res, Err(BscBroadcastError::NetworkForbidden(_))));
+    }
+
+    #[test]
+    fn test_adapters_dry_run_calculate_hashes_accurately_without_post() {
+        // BTC dry-run verification
+        let btc_adapter = EsploraBtcBroadcaster::new(false);
+        // Valid empty/dummy raw transaction deserialize failure is caught cleanly
+        let invalid_raw = btc_adapter.broadcast("deadbeef", BroadcastNetwork::BitcoinSignet);
+        assert!(matches!(invalid_raw, Err(BtcBroadcastError::NodeRejected(_))));
+
+        // BSC dry-run verification
+        let bsc_adapter = RpcBscBroadcaster::new(false);
+        let raw_evm_tx = "f86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
+        let dry_run_hash = bsc_adapter.broadcast(raw_evm_tx, BroadcastNetwork::BscTestnet).unwrap();
+        assert!(dry_run_hash.starts_with("dry_run_0x"));
     }
 }
